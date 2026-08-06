@@ -65,6 +65,24 @@ export interface WarningSettings {
 	anthropicExtraUsage?: boolean; // default: true
 }
 
+/**
+ * Maker/checker/failsafe verification routing.
+ *
+ * When `checkerModel` is set, every turn that ends without tool calls (a
+ * candidate final answer) is audited by the checker model. On conflict the
+ * turn is rejected with corrective feedback and retried, optionally switching
+ * to the failsafe model. Model refs accept "provider/id" (e.g.
+ * "openrouter/z-ai/glm-5.2") or a bare model id resolved against the runtime.
+ */
+export interface VerifySettings {
+	/** Model ref used to audit the maker's answer (the checker). */
+	checkerModel?: string;
+	/** Model ref used when the checker conflicts (the failsafe). */
+	failsafeModel?: string;
+	/** Thinking level for the checker pass. */
+	checkerThinkingLevel?: ThinkingLevel;
+}
+
 export type DefaultProjectTrust = "ask" | "always" | "never";
 
 export type TransportSetting = Transport;
@@ -122,6 +140,7 @@ export interface Settings {
 	doubleEscapeAction?: "fork" | "tree" | "none"; // Action for double-escape with empty editor (default: "tree")
 	treeFilterMode?: "default" | "no-tools" | "user-only" | "labeled-only" | "all"; // Default filter when opening /tree
 	thinkingBudgets?: ThinkingBudgetsSettings; // Custom token budgets for thinking levels
+	verify?: VerifySettings; // Maker/checker/failsafe verification routing (default: disabled)
 	editorPaddingX?: number; // Horizontal padding for input editor (default: 0)
 	outputPad?: 0 | 1; // Horizontal padding for chat message output (default: 1)
 	autocompleteMaxVisible?: number; // Max visible items in autocomplete dropdown (default: 5)
@@ -707,6 +726,10 @@ export class SettingsManager {
 
 	getSteeringMode(): "all" | "one-at-a-time" {
 		return this.settings.steeringMode || "one-at-a-time";
+	}
+
+	getVerifySettings(): VerifySettings | undefined {
+		return this.settings.verify;
 	}
 
 	setSteeringMode(mode: "all" | "one-at-a-time"): void {

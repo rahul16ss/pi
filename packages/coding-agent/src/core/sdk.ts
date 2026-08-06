@@ -1,6 +1,19 @@
 import { join } from "node:path";
-import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
+import {
+	Agent,
+	type AgentMessage,
+	setDefaultStreamFn,
+	type ThinkingLevel,
+	type TurnVerifyResult,
+	type VerifyTurnContext,
+} from "@earendil-works/pi-agent-core";
+import {
+	clampThinkingLevel,
+	type Message,
+	type Model,
+	streamSimple,
+	type TextContent,
+} from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession } from "./agent-session.ts";
@@ -14,7 +27,7 @@ import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
 import { getDefaultSessionDir, SessionManager } from "./session-manager.ts";
-import { SettingsManager } from "./settings-manager.ts";
+import { SettingsManager, type VerifySettings } from "./settings-manager.ts";
 import { time } from "./timings.ts";
 import {
 	createBashTool,
@@ -77,6 +90,21 @@ export interface CreateAgentSessionOptions {
 
 	/** Session manager. Default: SessionManager.create(cwd) */
 	sessionManager?: SessionManager;
+
+	/**
+	 * Maker/checker/failsafe verification routing.
+	 *
+	 * When `checkerModel` is set, the agent runs a second-model verifier after
+	 * each turn that has no tool calls (a candidate final answer): the maker
+	 * produces, the checker audits it, and on conflict the turn is retried with
+	 * corrective feedback, optionally switching to the failsafe model.
+	 *
+	 * Models are resolved from the runtime by "provider/id" ref or bare id. If a
+	 * model ref cannot be resolved, verification is skipped gracefully.
+	 *
+	 * Default: the `verify` section from settings.json.
+	 */
+	verifyConfig?: VerifySettings;
 
 	/** Settings manager. Default: SettingsManager.create(cwd, agentDir) */
 	settingsManager?: SettingsManager;
@@ -291,6 +319,75 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
+	// ── Maker/checker/failsafe verifier (default) ────────────────────────
+	// When verifyConfig is set (SDK option or `verify` in settings.json), after
+	// each turn with no tool calls (a candidate final answer) the checker model
+	// audits it; on conflict the turn is retried with corrective feedback,
+	// optionally switching to the failsafe model. Model refs resolve against
+	// the runtime as "provider/id" or bare id; unresolvable refs skip
+	// verification gracefully.
+	const verifyConfig = options.verifyConfig ?? settingsManager.getVerifySettings();
+	const resolveModel = (ref: string | undefined): Model<any> | undefined => {
+		if (!ref) return undefined;
+		const slash = ref.indexOf("/");
+		if (slash > 0) {
+			const byProvider = modelRuntime.getModel(ref.slice(0, slash), ref.slice(slash + 1));
+			if (byProvider) return byProvider;
+		}
+		return modelRuntime.getModels().find((m) => m.id === ref);
+	};
+	const defaultVerifyTurn =
+		verifyConfig?.checkerModel && resolveModel(verifyConfig.checkerModel)
+			? (() => {
+					let rejections = 0;
+					const MAX_REJECTIONS = 2; // never loop forever
+					return async (vctx: VerifyTurnContext): Promise<TurnVerifyResult | undefined> => {
+						const checker = resolveModel(verifyConfig.checkerModel);
+						if (!checker) return undefined;
+						// Respect the rejection cap: after MAX_REJECTIONS the maker's
+						// answer is accepted so the loop can always terminate.
+						if (rejections >= MAX_REJECTIONS) return { status: "verified" };
+						const auditPrompt =
+							"You are an independent checker. The maker produced this answer. If it fully and correctly " +
+							"satisfies the task with no errors, reply EXACTLY: VERIFIED. Otherwise reply with the specific " +
+							"problem, then the word CONFLICT.";
+						const audit = await vctx.runModel(
+							checker,
+							[...vctx.context.messages, { role: "user", content: auditPrompt, timestamp: Date.now() }],
+							{ thinkingLevel: verifyConfig.checkerThinkingLevel },
+						);
+						const auditText = (
+							typeof audit.content === "string"
+								? audit.content
+								: audit.content
+										.filter((c): c is TextContent => c.type === "text")
+										.map((c) => c.text)
+										.join(" ")
+						).trim();
+						// Verified: accept.
+						if (/VERIFIED/i.test(auditText)) {
+							rejections = 0;
+							return { status: "verified" };
+						}
+						// Only an explicit CONFLICT is a real rejection, AND it must
+						// carry non-empty feedback. An empty or ambiguous checker
+						// verdict (e.g. the checker itself failed/aborted) is treated
+						// as "no signal" → skip verification rather than block the maker.
+						if (!/CONFLICT/i.test(auditText) || auditText.length === 0) return undefined;
+						rejections++;
+						const failsafe = resolveModel(verifyConfig.failsafeModel);
+						return {
+							status: "rejected",
+							correctivePrompt:
+								`[MAKER/CHECKER/FAILSAFE] Your previous answer was rejected by the checker. Feedback: ${auditText.slice(0, 800)}. ` +
+								`Rework the answer correctly; do not repeat the rejected approach.`,
+							model: failsafe,
+							thinkingLevel: failsafe ? "max" : undefined,
+						};
+					};
+				})()
+			: undefined;
+
 	agent = new Agent({
 		initialState: {
 			systemPrompt: "",
@@ -354,6 +451,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		steeringMode: settingsManager.getSteeringMode(),
 		followUpMode: settingsManager.getFollowUpMode(),
+		verifyTurn: defaultVerifyTurn,
 		transport: settingsManager.getTransport(),
 		thinkingBudgets: settingsManager.getThinkingBudgets(),
 		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
