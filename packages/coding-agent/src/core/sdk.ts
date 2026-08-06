@@ -1,21 +1,6 @@
-import { execSync } from "node:child_process";
 import { join } from "node:path";
-import {
-	Agent,
-	type AgentMessage,
-	setDefaultStreamFn,
-	type ThinkingLevel,
-	type TurnVerifyResult,
-	type VerifyTurnContext,
-} from "@earendil-works/pi-agent-core";
-import {
-	type AssistantMessage,
-	clampThinkingLevel,
-	type Message,
-	type Model,
-	streamSimple,
-	type TextContent,
-} from "@earendil-works/pi-ai/compat";
+import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession } from "./agent-session.ts";
@@ -44,6 +29,7 @@ import {
 	type ToolName,
 	withFileMutationQueue,
 } from "./tools/index.ts";
+import { createVerifyAuditLogger, createVerifyRouting } from "./verify-routing.ts";
 
 // Preserve the pre-0.81 fallback for extensions that construct Agent instances
 // or invoke low-level agent loops without supplying streamFn. Agent core remains
@@ -101,6 +87,10 @@ export interface CreateAgentSessionOptions {
 	 * produces, the checker audits it, and on conflict the maker retries with
 	 * corrective feedback. On the Nth consecutive rejection the planner model
 	 * decomposes the problem into a plan for the maker to execute.
+	 *
+	 * Mid-build extensions (optional settings):
+	 * - `planFirst`: planner runs once before the first maker turn
+	 * - `checkpointEveryToolTurns`: checker audits progress every N tool turns
 	 *
 	 * Models are resolved from the runtime by "provider/id" ref or bare id. If a
 	 * model ref cannot be resolved, verification is skipped gracefully.
@@ -326,15 +316,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
-	// ── Maker/checker/planner verifier (default) ─────────────────────────
-	// When verifyConfig is set (SDK option or `verify` in settings.json), after
-	// each turn with no tool calls (a candidate final answer) the checker model
-	// audits it; on conflict the maker retries with corrective feedback. On the
-	// Nth consecutive rejection the planner model decomposes the problem into a
-	// plan that the maker then executes (plan with a higher model, build with a
-	// lower one) — the planner never executes, so its spend stays minimal.
-	// Model refs resolve against the runtime as "provider/id" or bare id;
-	// unresolvable refs skip verification gracefully.
+	// ── Maker/checker/planner verifier (final + mid-build) ────────────────
+	// When verifyConfig is set (SDK option or `verify` in settings.json):
+	// - planFirst: planner decomposes the goal before the maker starts
+	// - checkpoints: every N tool-using turns the checker audits progress
+	// - final: after a no-tool-call answer the checker audits; planner escalates
+	// Checker/planner never become the session model — the maker always executes.
 	const verifyConfig = options.verifyConfig ?? settingsManager.getVerifySettings();
 	const resolveModel = (ref: string | undefined): Model<any> | undefined => {
 		if (!ref) return undefined;
@@ -345,145 +332,67 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		return modelRuntime.getModels().find((m) => m.id === ref);
 	};
-	const messageText = (m: AssistantMessage): string =>
-		(typeof m.content === "string"
-			? m.content
-			: m.content
-					.filter((c): c is TextContent => c.type === "text")
-					.map((c) => c.text)
-					.join(" ")
-		).trim();
-	const makerModel = model;
-	const makerThinkingLevel = thinkingLevel;
-	const defaultVerifyTurn =
-		verifyConfig?.checkerModel && resolveModel(verifyConfig.checkerModel)
-			? (() => {
-					let rejections = 0;
-					return async (vctx: VerifyTurnContext): Promise<TurnVerifyResult | undefined> => {
-						// Conversational turns (runs that used no tools) are not worth
-						// paying an audit for.
-						if (verifyConfig.auditOnlyAfterTools && !vctx.newMessages.some((m) => m.role === "toolResult")) {
-							return undefined;
-						}
-						const checker = resolveModel(verifyConfig.checkerModel);
-						if (!checker) return undefined;
-						const verifierCommands = verifyConfig.verifierCommands ?? [];
-						const auditPrompt =
-							"You are an independent checker. You are given the goal, the real tool receipts, and the maker's " +
-							"final answer — not the maker's reasoning. Reply EXACTLY: VERIFIED only if the answer fully and " +
-							"correctly satisfies the goal AND the receipts show real verification (tests/build/lint actually " +
-							"ran and passed). If the answer is wrong, incomplete, or its claims are unverified, reply with " +
-							"the specific problem, then the word CONFLICT." +
-							(verifierCommands.length
-								? ` If you need fresh evidence before judging, reply EXACTLY "RUN: <command>" with one of: ${verifierCommands.join(", ")}. The harness — not the maker — runs it and you receive the raw output.`
-								: "");
-						// Fresh-context audit input: the run's goal(s) and tool receipts
-						// plus the candidate answer — not the maker's intermediate
-						// reasoning or justifications. Cheaper and harder to sweet-talk.
-						const auditMessages: AgentMessage[] = vctx.newMessages.filter(
-							(m) => m.role === "user" || m.role === "toolResult",
-						);
-						auditMessages.push({
-							role: "user",
-							content: `Candidate final answer under review:\n${messageText(vctx.message)}`,
-							timestamp: Date.now(),
-						});
-						auditMessages.push({ role: "user", content: auditPrompt, timestamp: Date.now() });
-						let audit = await vctx.runModel(checker, auditMessages, {
-							thinkingLevel: verifyConfig.checkerThinkingLevel,
-						});
-						let auditText = messageText(audit);
-						// Checker-directed verification: on "RUN: <cmd>" the harness (not
-						// the maker) executes an allowlisted command and the checker
-						// re-judges against the raw output. One RUN per audit.
-						const requested = /^RUN:\s*(\S.*)$/m.exec(auditText)?.[1]?.trim();
-						if (requested && verifierCommands.includes(requested)) {
-							let output: string;
-							try {
-								output = execSync(requested, {
-									cwd,
-									timeout: 120_000,
-									encoding: "utf8",
-									maxBuffer: 4 * 1024 * 1024,
-									stdio: ["ignore", "pipe", "pipe"],
-								}).slice(-4000);
-							} catch (error) {
-								const err = error as { status?: number; stdout?: string | Buffer; stderr?: string | Buffer };
-								output =
-									`exit ${err.status ?? "?"}\n` +
-									`${String(err.stdout ?? "").slice(-2000)}\n${String(err.stderr ?? "").slice(-2000)}`.trim();
-							}
-							audit = await vctx.runModel(
-								checker,
-								[
-									...auditMessages,
-									{
-										role: "user",
-										content: `Output of \`${requested}\` (run by the harness, tail):\n${output}`,
-										timestamp: Date.now(),
-									},
-								],
-								{ thinkingLevel: verifyConfig.checkerThinkingLevel },
-							);
-							auditText = messageText(audit);
-						}
-						// Verified: accept.
-						if (/VERIFIED/i.test(auditText)) {
-							rejections = 0;
-							return { status: "verified" };
-						}
-						// Only an explicit CONFLICT is a real rejection, AND it must
-						// carry non-empty feedback. An empty or ambiguous checker
-						// verdict (e.g. the checker itself failed/aborted) is treated
-						// as "no signal" → skip verification rather than block the maker.
-						if (!/CONFLICT/i.test(auditText) || auditText.length === 0) return undefined;
-						rejections++;
-						// Rejection budget: once exhausted, accept the answer as-is so the
-						// loop always terminates and checker/planner spend stays bounded.
-						if (rejections > (verifyConfig.maxRejections ?? 2)) {
-							rejections = 0;
-							return undefined;
-						}
-						// On the Nth consecutive rejection, escalate to the planner: it
-						// decomposes the problem into a plan instead of answering, and the
-						// (cheap) maker executes the retry — the planner never executes.
-						const planner = resolveModel(verifyConfig.plannerModel);
-						let planText = "";
-						if (planner && rejections >= (verifyConfig.planAfterRejections ?? 1)) {
-							const plan = await vctx.runModel(
-								planner,
-								[
-									...vctx.context.messages,
-									{
-										role: "user",
-										content:
-											`A checker rejected the previous answer. Feedback: ${auditText.slice(0, 800)}\n\n` +
-											"You are a senior planner. Do NOT answer the task yourself. Break the problem down into " +
-											"a short, concrete, step-by-step plan that a cheaper maker model can execute to produce " +
-											"a correct answer. Address the checker's feedback.",
-										timestamp: Date.now(),
-									},
-								],
-								{ thinkingLevel: verifyConfig.plannerThinkingLevel ?? "max" },
-							);
-							planText = messageText(plan);
-						}
-						return {
-							status: "rejected",
-							correctivePrompt: planText
-								? `[MAKER/CHECKER/PLANNER] Your previous answer was rejected by the checker. Feedback: ${auditText.slice(0, 800)}. ` +
-									`The planner produced this plan:\n${planText.slice(0, 2000)}\n` +
-									"Execute the plan step by step; do not repeat the rejected approach."
-								: `[MAKER/CHECKER/PLANNER] Your previous answer was rejected by the checker. Feedback: ${auditText.slice(0, 800)}. ` +
-									`Rework the answer correctly; do not repeat the rejected approach.`,
-							// The retry always runs on the session (maker) model, so the
-							// planner/failsafe can never stick as the session model.
-							model: makerModel,
-							thinkingLevel: makerThinkingLevel,
-						};
-					};
-				})()
-			: undefined;
+	const verifyAuditLog = join(agentDir, "verify-audit.jsonl");
+	const logVerify = createVerifyAuditLogger(verifyAuditLog);
+	const routing =
+		verifyConfig &&
+		model &&
+		createVerifyRouting({
+			verify: verifyConfig,
+			makerModel: model,
+			makerThinkingLevel: thinkingLevel,
+			cwd,
+			auditLogPath: verifyAuditLog,
+			resolveModel,
+		});
+	logVerify(
+		routing
+			? {
+					event: "installed",
+					checker: verifyConfig?.checkerModel,
+					checkpointChecker: verifyConfig?.checkpointCheckerModel ?? verifyConfig?.checkerModel,
+					planner: verifyConfig?.plannerModel,
+					escalationMaker: verifyConfig?.escalationMakerModel ?? null,
+					planFirst: verifyConfig?.planFirst ?? Boolean(verifyConfig?.plannerModel),
+					checkpointEveryToolTurns: verifyConfig?.checkpointEveryToolTurns ?? 0,
+					escalateAfterRejections: verifyConfig?.escalateAfterRejections ?? 1,
+				}
+			: {
+					event: "disabled",
+					reason: verifyConfig?.checkerModel ? "checker-unresolvable" : "no-checker-configured",
+				},
+	);
+
+	const syncSessionModel = (next?: Model<any>, nextThinking?: ThinkingLevel): void => {
+		if (!next || !agent) return;
+		agent.state.model = next;
+		if (nextThinking !== undefined) {
+			agent.state.thinkingLevel = nextThinking;
+		}
+	};
+
+	const wrappedVerifyTurn = routing
+		? async (ctx: Parameters<NonNullable<typeof routing.verifyTurn>>[0]) => {
+				const result = await routing.verifyTurn(ctx);
+				if (result?.status === "rejected" && result.model) {
+					syncSessionModel(result.model, result.thinkingLevel);
+				}
+				if (result?.status === "verified") {
+					syncSessionModel(result.model ?? model, result.thinkingLevel ?? thinkingLevel);
+				}
+				return result;
+			}
+		: undefined;
+
+	const wrappedBeforeFirstTurn = routing
+		? async (ctx: Parameters<NonNullable<typeof routing.beforeFirstTurn>>[0]) => {
+				const prep = await routing.beforeFirstTurn(ctx);
+				if (prep?.model) {
+					syncSessionModel(prep.model, prep.thinkingLevel);
+				}
+				return prep;
+			}
+		: undefined;
 
 	agent = new Agent({
 		initialState: {
@@ -548,7 +457,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		steeringMode: settingsManager.getSteeringMode(),
 		followUpMode: settingsManager.getFollowUpMode(),
-		verifyTurn: defaultVerifyTurn,
+		beforeFirstTurn: wrappedBeforeFirstTurn,
+		shouldCheckpoint: routing ? (ctx) => routing.shouldCheckpoint(ctx) : undefined,
+		verifyTurn: wrappedVerifyTurn,
 		transport: settingsManager.getTransport(),
 		thinkingBudgets: settingsManager.getThinkingBudgets(),
 		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,

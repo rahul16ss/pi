@@ -1610,3 +1610,204 @@ describe("verifyTurn maker/checker/failsafe loop", () => {
 		expect(corrective).toEqual(["go", "Conflict: rework the answer with maximum rigor."]);
 	});
 });
+
+describe("mid-build plan/checkpoint routing in agent loop", () => {
+	function modelWithId(id: string): Model<any> {
+		const m = createModel();
+		return { ...m, id };
+	}
+
+	function textOf(message: AssistantMessage): string {
+		return message.content
+			.filter((c): c is Extract<AssistantMessage["content"][number], { type: "text" }> => c.type === "text")
+			.map((c) => c.text)
+			.join(" ");
+	}
+
+	const bashTool: AgentTool = {
+		name: "bash",
+		label: "bash",
+		description: "run",
+		parameters: Type.Object({ command: Type.String() }),
+		execute: async () => ({
+			content: [{ type: "text", text: "ok" }],
+			details: {},
+		}),
+	};
+
+	it("runs beforeFirstTurn planner, then maker; checkpoint does not end the run", async () => {
+		const modelCalls: string[] = [];
+		let makerTurns = 0;
+		const streamFn = (model: Model<any>) => {
+			modelCalls.push(model.id);
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (model.id === "anthropic/claude-opus-5") {
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "1. ls\n2. done" }]),
+					});
+					return;
+				}
+				if (model.id === "openai/gpt-5.6-luna") {
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "VERIFIED" }]),
+					});
+					return;
+				}
+				makerTurns++;
+				if (makerTurns === 1) {
+					stream.push({
+						type: "done",
+						reason: "toolUse",
+						message: createAssistantMessage([
+							{
+								type: "toolCall",
+								id: "call_1",
+								name: "bash",
+								arguments: { command: "ls" },
+							},
+						]),
+					});
+				} else {
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "all done" }]),
+					});
+				}
+			});
+			return stream;
+		};
+
+		const config: AgentLoopConfig = {
+			model: modelWithId("deepseek/deepseek-v4-flash-0731"),
+			convertToLlm: identityConverter,
+			beforeFirstTurn: async (ctx) => {
+				const plan = await ctx.runModel(modelWithId("anthropic/claude-opus-5"), [
+					{ role: "user", content: "plan", timestamp: Date.now() },
+				]);
+				return {
+					messages: [
+						{
+							role: "user",
+							content: `[PLANNER]\n${textOf(plan)}`,
+							timestamp: Date.now(),
+						},
+					],
+					model: modelWithId("deepseek/deepseek-v4-flash-0731"),
+				};
+			},
+			shouldCheckpoint: ({ toolTurnCount }) => toolTurnCount === 1,
+			verifyTurn: async (ctx) => {
+				const audit = await ctx.runModel(modelWithId("openai/gpt-5.6-luna"), [
+					{ role: "user", content: `kind=${ctx.kind}`, timestamp: Date.now() },
+				]);
+				return /VERIFIED/i.test(textOf(audit)) ? { status: "verified" } : undefined;
+			},
+		};
+
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [bashTool] };
+		const injected: string[] = [];
+		const stream = agentLoop([createUserMessage("build a thing")], context, config, undefined, streamFn);
+		for await (const event of stream) {
+			if (event.type === "message_end" && event.message.role === "user") {
+				const text = typeof event.message.content === "string" ? event.message.content : "";
+				if (text.includes("[PLANNER]")) injected.push(text);
+			}
+		}
+		await stream.result();
+
+		expect(injected.some((t) => t.includes("1. ls"))).toBe(true);
+		// planner (beforeFirst) → maker tool turn → checker checkpoint → maker final → checker final
+		expect(modelCalls).toEqual([
+			"anthropic/claude-opus-5",
+			"deepseek/deepseek-v4-flash-0731",
+			"openai/gpt-5.6-luna",
+			"deepseek/deepseek-v4-flash-0731",
+			"openai/gpt-5.6-luna",
+		]);
+	});
+
+	it("on checkpoint reject, injects corrective and continues with maker (does not stop)", async () => {
+		const modelCalls: string[] = [];
+		let makerTurns = 0;
+		const streamFn = (model: Model<any>) => {
+			modelCalls.push(model.id);
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (model.id === "openai/gpt-5.6-luna") {
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "Missing tests CONFLICT" }]),
+					});
+					return;
+				}
+				makerTurns++;
+				if (makerTurns <= 2) {
+					stream.push({
+						type: "done",
+						reason: "toolUse",
+						message: createAssistantMessage([
+							{
+								type: "toolCall",
+								id: `call_${makerTurns}`,
+								name: "bash",
+								arguments: { command: "ls" },
+							},
+						]),
+					});
+				} else {
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "finished after correction" }]),
+					});
+				}
+			});
+			return stream;
+		};
+
+		let checkpoints = 0;
+		const config: AgentLoopConfig = {
+			model: modelWithId("deepseek/deepseek-v4-flash-0731"),
+			convertToLlm: identityConverter,
+			shouldCheckpoint: ({ toolTurnCount }) => toolTurnCount === 1,
+			verifyTurn: async (ctx) => {
+				if (ctx.kind === "checkpoint") {
+					checkpoints++;
+					await ctx.runModel(modelWithId("openai/gpt-5.6-luna"), [
+						{ role: "user", content: "audit", timestamp: Date.now() },
+					]);
+					return {
+						status: "rejected",
+						correctivePrompt: "[CHECKPOINT] fix tests",
+						model: modelWithId("deepseek/deepseek-v4-flash-0731"),
+					};
+				}
+				return { status: "verified" };
+			},
+		};
+
+		const corrective: string[] = [];
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [bashTool] };
+		const stream = agentLoop([createUserMessage("build")], context, config, undefined, streamFn);
+		for await (const event of stream) {
+			if (event.type === "message_start" && event.message.role === "user") {
+				const text = typeof event.message.content === "string" ? event.message.content : "";
+				if (text.includes("[CHECKPOINT]")) corrective.push(text);
+			}
+		}
+		await stream.result();
+
+		expect(checkpoints).toBe(1);
+		expect(corrective).toEqual(["[CHECKPOINT] fix tests"]);
+		expect(modelCalls[0]).toBe("deepseek/deepseek-v4-flash-0731");
+		expect(modelCalls).toContain("openai/gpt-5.6-luna");
+		expect(modelCalls.filter((id) => id === "deepseek/deepseek-v4-flash-0731").length).toBeGreaterThanOrEqual(3);
+	});
+});

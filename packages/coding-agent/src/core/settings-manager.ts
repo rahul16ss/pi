@@ -77,27 +77,61 @@ export interface WarningSettings {
  * bare model id resolved against the runtime.
  */
 export interface VerifySettings {
-	/** Model ref used to audit the maker's answer (the checker). */
+	/**
+	 * Model ref used for final-answer audits (the final checker).
+	 * Example: "openrouter/moonshotai/kimi-k3"
+	 */
 	checkerModel?: string;
-	/** Model ref that produces a plan when the maker/checker conflict (the planner). Never executes. */
+	/**
+	 * Model ref for mid-build progress audits. Defaults to checkerModel when unset.
+	 * Example: "openrouter/z-ai/glm-5.2"
+	 */
+	checkpointCheckerModel?: string;
+	/** Model ref that produces a plan (the planner). Never executes tool work. */
 	plannerModel?: string;
-	/** Thinking level for the checker pass. */
+	/**
+	 * Stronger maker used after repeated checker rejections.
+	 * Example: "openrouter/openai/gpt-5.6-luna"
+	 */
+	escalationMakerModel?: string;
+	/** Thinking level for the final checker pass. */
 	checkerThinkingLevel?: ThinkingLevel;
+	/** Thinking level for mid-build checkpoint audits (default: checkerThinkingLevel). */
+	checkpointCheckerThinkingLevel?: ThinkingLevel;
 	/** Thinking level for the planner pass (default: "max"). */
 	plannerThinkingLevel?: ThinkingLevel;
-	/** Max consecutive rejections per answer before accepting it as-is (default: 2). Bounds checker/planner spend. */
+	/** Thinking level while the escalated maker is active (default: "max"). */
+	escalationMakerThinkingLevel?: ThinkingLevel;
+	/** Max consecutive rejections per streak before accepting as-is (default: 2). */
 	maxRejections?: number;
-	/** Invoke the planner on the Nth consecutive rejection (default: 1 = immediately). Set above maxRejections to disable the planner. */
+	/** Invoke the planner on the Nth consecutive rejection (default: 1). */
 	planAfterRejections?: number;
-	/** Skip audits for runs that used no tools (default: false). Avoids auditing conversational replies. */
+	/**
+	 * Switch retries to escalationMakerModel on the Nth consecutive rejection
+	 * (default: 1 = first reject). Set above maxRejections to disable escalation.
+	 */
+	escalateAfterRejections?: number;
+	/** Skip audits for runs that used no tools (default: false). */
 	auditOnlyAfterTools?: boolean;
 	/**
 	 * Allowlist of shell commands the checker may order the harness to run for
-	 * independent evidence (e.g. ["npm run check", "./test.sh"]). The harness —
-	 * not the maker — executes the matched command and returns raw output.
-	 * Default: [] (checker judges from the transcript only).
+	 * independent evidence (e.g. ["npm run check", "./test.sh"]).
 	 */
 	verifierCommands?: string[];
+	/**
+	 * Run the planner once before the first maker turn (default: true when
+	 * plannerModel is set). Skipped for short prompts below planMinPromptChars.
+	 */
+	planFirst?: boolean;
+	/** Minimum user-prompt length to trigger planFirst (default: 80). */
+	planMinPromptChars?: number;
+	/**
+	 * Run a mid-build checker checkpoint every N tool-using turns (default: 0 =
+	 * disabled).
+	 */
+	checkpointEveryToolTurns?: number;
+	/** Max mid-build checkpoints per agent run (default: 3). */
+	maxCheckpointsPerRun?: number;
 }
 
 export type DefaultProjectTrust = "ask" | "always" | "never";

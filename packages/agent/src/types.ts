@@ -144,13 +144,11 @@ export interface PrepareNextTurnContext extends ShouldStopAfterTurnContext {}
 /**
  * Context passed to a maker/checker/failsafe `verifyTurn` pass.
  *
- * Runs after a complete turn whose assistant message has NO tool calls (a
- * candidate final answer). Useful for a multi-model loop: the maker produced
- * the answer; the verifier (a second model) audits it; on conflict a failsafe
- * model can re-attempt.
+ * - `kind: "final"` (default): after a turn with no tool calls (candidate final answer).
+ * - `kind: "checkpoint"`: mid-build audit after a tool-using turn (progress check).
  */
 export interface VerifyTurnContext {
-	/** The completed assistant message (no tool calls) to verify. */
+	/** The completed assistant message to verify (final answer or mid-build progress). */
 	message: AssistantMessage;
 	/** Current agent context after the turn's message has been appended. */
 	context: AgentContext;
@@ -158,9 +156,13 @@ export interface VerifyTurnContext {
 	newMessages: AgentMessage[];
 	config: AgentLoopConfig;
 	signal?: AbortSignal;
+	/** Final answer audit vs mid-build progress audit. Default: "final". */
+	kind?: "final" | "checkpoint";
+	/** Number of tool-using turns completed so far in this run (1-based when kind is checkpoint). */
+	toolTurnCount?: number;
 	/**
 	 * Run a second model over a fresh message list and return its final
-	 * assistant message. Use this to run the checker/failsafe model.
+	 * assistant message. Use this to run the checker/failsafe/planner model.
 	 */
 	runModel: (
 		model: Model<any>,
@@ -169,14 +171,43 @@ export interface VerifyTurnContext {
 	) => Promise<AssistantMessage>;
 }
 
-/** Result of a maker/checker/failsafe `verifyTurn` pass. */
+/**
+ * Context for an optional pre-flight hook that runs once before the first
+ * assistant turn (e.g. plan-first with a planner model).
+ */
+export interface BeforeFirstTurnContext {
+	context: AgentContext;
+	newMessages: AgentMessage[];
+	config: AgentLoopConfig;
+	signal?: AbortSignal;
+	runModel: (
+		model: Model<any>,
+		manualMessages: AgentMessage[],
+		opts?: { thinkingLevel?: ThinkingLevel },
+	) => Promise<AssistantMessage>;
+}
+
+/** Result of `beforeFirstTurn`: inject messages and/or set the model for the first maker turn. */
+export interface BeforeFirstTurnResult {
+	messages?: AgentMessage[];
+	model?: Model<any>;
+	thinkingLevel?: ThinkingLevel;
+}
+
+/** Result of a maker/checker/planner `verifyTurn` pass. */
 export type TurnVerifyResult =
-	| { status: "verified" }
+	| {
+			status: "verified";
+			/** Optional model to switch to after verification (e.g. demote from escalated maker). */
+			model?: Model<any>;
+			/** Optional thinking level to apply with `model`. */
+			thinkingLevel?: ThinkingLevel;
+	  }
 	| {
 			status: "rejected";
 			/** User message injected before the next turn (the corrective feedback). */
 			correctivePrompt: string;
-			/** Optional model to switch to for the retry (e.g. the failsafe). */
+			/** Optional model to switch to for the retry (e.g. escalated maker). */
 			model?: Model<any>;
 			/** Optional thinking level for the retry. */
 			thinkingLevel?: ThinkingLevel;
@@ -261,17 +292,39 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	/**
 	 * Optional maker/checker/failsafe verifier pass.
 	 *
-	 * Called after a complete turn whose assistant message has NO tool calls
-	 * (a candidate final answer). Return `{ status: "verified" }` to stop the
-	 * loop. Return `{ status: "rejected", correctivePrompt, model?, thinkingLevel? }`
-	 * to inject corrective feedback and continue with the (optionally switched)
-	 * model for another turn.
+	 * Called after a complete turn when:
+	 * - the assistant message has NO tool calls (`kind: "final"`), or
+	 * - `shouldCheckpoint` returns true after a tool-using turn (`kind: "checkpoint"`).
+	 *
+	 * For `final`: `{ status: "verified" }` stops the loop.
+	 * For `checkpoint`: `{ status: "verified" }` continues building (does not stop).
+	 * `{ status: "rejected", correctivePrompt, model?, thinkingLevel? }` injects
+	 * corrective feedback and continues with the (optionally switched) model.
 	 *
 	 * Contract: must not throw or reject. Return undefined to skip verification.
 	 * Keep the hook pure of side effects beyond calling `context.runModel` to
-	 * audit the answer with a second model.
+	 * audit with a second model.
 	 */
 	verifyTurn?: (context: VerifyTurnContext) => TurnVerifyResult | undefined | Promise<TurnVerifyResult | undefined>;
+
+	/**
+	 * After a tool-using turn, decide whether to run `verifyTurn` as a mid-build
+	 * checkpoint. Receives the 1-based count of tool-using turns in this run.
+	 *
+	 * Contract: must not throw or reject. Return false when unsure.
+	 */
+	shouldCheckpoint?: (context: ShouldStopAfterTurnContext & { toolTurnCount: number }) => boolean | Promise<boolean>;
+
+	/**
+	 * Runs once before the first assistant turn of a loop invocation.
+	 * Use to inject a planner plan (or other priming messages) and optionally
+	 * set the model/thinking level for the first maker turn.
+	 *
+	 * Contract: must not throw or reject. Return undefined to skip.
+	 */
+	beforeFirstTurn?: (
+		context: BeforeFirstTurnContext,
+	) => BeforeFirstTurnResult | undefined | Promise<BeforeFirstTurnResult | undefined>;
 
 	/**
 	 * Called after `turn_end` and before the loop decides whether another provider request should start.

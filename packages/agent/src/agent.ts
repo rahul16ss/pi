@@ -19,6 +19,8 @@ import type {
 	AgentMessage,
 	AgentState,
 	AgentTool,
+	BeforeFirstTurnContext,
+	BeforeFirstTurnResult,
 	BeforeToolCallContext,
 	BeforeToolCallResult,
 	PrepareNextTurnContext,
@@ -109,10 +111,18 @@ export interface AgentOptions {
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
 	shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext, signal?: AbortSignal) => boolean | Promise<boolean>;
 	/**
-	 * Optional maker/checker/failsafe verifier pass, run after a turn with no
-	 * tool calls. See `AgentLoopConfig.verifyTurn`.
+	 * Optional maker/checker/planner verifier pass. See `AgentLoopConfig.verifyTurn`.
 	 */
 	verifyTurn?: (context: VerifyTurnContext) => TurnVerifyResult | undefined | Promise<TurnVerifyResult | undefined>;
+	/** Mid-build checkpoint gate. See `AgentLoopConfig.shouldCheckpoint`. */
+	shouldCheckpoint?: (
+		context: ShouldStopAfterTurnContext & { toolTurnCount: number },
+		signal?: AbortSignal,
+	) => boolean | Promise<boolean>;
+	/** Plan-first priming. See `AgentLoopConfig.beforeFirstTurn`. */
+	beforeFirstTurn?: (
+		context: BeforeFirstTurnContext,
+	) => BeforeFirstTurnResult | undefined | Promise<BeforeFirstTurnResult | undefined>;
 	prepareNextTurn?: (
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
@@ -204,6 +214,13 @@ export class Agent {
 	public verifyTurn?: (
 		context: VerifyTurnContext,
 	) => TurnVerifyResult | undefined | Promise<TurnVerifyResult | undefined>;
+	public shouldCheckpoint?: (
+		context: ShouldStopAfterTurnContext & { toolTurnCount: number },
+		signal?: AbortSignal,
+	) => boolean | Promise<boolean>;
+	public beforeFirstTurn?: (
+		context: BeforeFirstTurnContext,
+	) => BeforeFirstTurnResult | undefined | Promise<BeforeFirstTurnResult | undefined>;
 	public prepareNextTurn?: (
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
@@ -237,6 +254,8 @@ export class Agent {
 		this.afterToolCall = runtimeOptions.afterToolCall;
 		this.shouldStopAfterTurn = runtimeOptions.shouldStopAfterTurn;
 		this.verifyTurn = runtimeOptions.verifyTurn;
+		this.shouldCheckpoint = runtimeOptions.shouldCheckpoint;
+		this.beforeFirstTurn = runtimeOptions.beforeFirstTurn;
 		this.prepareNextTurn = runtimeOptions.prepareNextTurn;
 		this.prepareNextTurnWithContext = runtimeOptions.prepareNextTurnWithContext;
 		this.steeringQueue = new PendingMessageQueue(runtimeOptions.steeringMode ?? "one-at-a-time");
@@ -468,6 +487,10 @@ export class Agent {
 				? async (context) => await shouldStopAfterTurn(context, this.signal)
 				: undefined,
 			verifyTurn: this.verifyTurn ? async (context) => await this.verifyTurn?.(context) : undefined,
+			shouldCheckpoint: this.shouldCheckpoint
+				? async (context) => Boolean(await this.shouldCheckpoint?.(context, this.signal))
+				: undefined,
+			beforeFirstTurn: this.beforeFirstTurn ? async (context) => await this.beforeFirstTurn?.(context) : undefined,
 			prepareNextTurn:
 				this.prepareNextTurnWithContext || this.prepareNextTurn
 					? async (context) => {

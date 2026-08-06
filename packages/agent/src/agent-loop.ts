@@ -166,8 +166,43 @@ async function runLoop(
 	let currentContext = initialContext;
 	let config = initialConfig;
 	let firstTurn = true;
+	let toolTurnCount = 0;
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
+
+	const runModel = (m: Model<any>, manualMessages: AgentMessage[], opts?: { thinkingLevel?: ThinkingLevel }) =>
+		runVerifierModel(m, manualMessages, config, signal, streamFunction, opts?.thinkingLevel);
+
+	// Optional plan-first / priming pass before the first assistant turn.
+	if (config.beforeFirstTurn) {
+		let prep: Awaited<ReturnType<NonNullable<AgentLoopConfig["beforeFirstTurn"]>>>;
+		try {
+			prep = await config.beforeFirstTurn({
+				context: currentContext,
+				newMessages,
+				config,
+				signal,
+				runModel,
+			});
+		} catch {
+			prep = undefined;
+		}
+		if (prep?.messages?.length) {
+			for (const message of prep.messages) {
+				await emit({ type: "message_start", message });
+				await emit({ type: "message_end", message });
+				currentContext.messages.push(message);
+				newMessages.push(message);
+			}
+		}
+		if (prep?.model) config = { ...config, model: prep.model };
+		if (prep?.thinkingLevel !== undefined) {
+			config = {
+				...config,
+				reasoning: prep.thinkingLevel === "off" ? undefined : prep.thinkingLevel,
+			};
+		}
+	}
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
@@ -222,16 +257,37 @@ async function runLoop(
 					currentContext.messages.push(result);
 					newMessages.push(result);
 				}
+				toolTurnCount++;
 			}
 
 			await emit({ type: "turn_end", message, toolResults });
 
-			// ── Maker/checker/failsafe verifier pass (optional) ──────────────
-			// Runs only on a candidate final answer (no tool calls). The hook can
-			// audit it with a second model via context.runModel and either accept
-			// it (verified → stop) or reject it (inject corrective feedback,
-			// optionally switching model for the retry, e.g. a failsafe).
+			// ── Maker/checker/planner verifier (final and mid-build checkpoint) ──
+			const turnContext = {
+				message,
+				toolResults,
+				context: currentContext,
+				newMessages,
+			};
+			let verifyKind: "final" | "checkpoint" | undefined;
 			if (config.verifyTurn && toolCalls.length === 0) {
+				verifyKind = "final";
+			} else if (config.verifyTurn && toolCalls.length > 0) {
+				let checkpoint = false;
+				try {
+					checkpoint = Boolean(
+						await config.shouldCheckpoint?.({
+							...turnContext,
+							toolTurnCount,
+						}),
+					);
+				} catch {
+					checkpoint = false;
+				}
+				if (checkpoint) verifyKind = "checkpoint";
+			}
+
+			if (config.verifyTurn && verifyKind) {
 				let verifyResult: TurnVerifyResult;
 				try {
 					verifyResult = await config.verifyTurn({
@@ -240,18 +296,28 @@ async function runLoop(
 						newMessages,
 						config,
 						signal,
-						runModel: (m, manualMessages, opts) =>
-							runVerifierModel(m, manualMessages, config, signal, streamFunction, opts?.thinkingLevel),
+						kind: verifyKind,
+						toolTurnCount,
+						runModel,
 					});
 				} catch {
 					verifyResult = undefined; // honor the graceful contract
 				}
 
 				if (verifyResult?.status === "verified") {
-					await emit({ type: "agent_end", messages: newMessages });
-					return;
-				}
-				if (verifyResult?.status === "rejected") {
+					if (verifyResult.model) config = { ...config, model: verifyResult.model };
+					if (verifyResult.thinkingLevel !== undefined) {
+						config = {
+							...config,
+							reasoning: verifyResult.thinkingLevel === "off" ? undefined : verifyResult.thinkingLevel,
+						};
+					}
+					// Final verified → stop. Checkpoint verified → keep building (possibly demoted).
+					if (verifyKind === "final") {
+						await emit({ type: "agent_end", messages: newMessages });
+						return;
+					}
+				} else if (verifyResult?.status === "rejected") {
 					const corrective: AgentMessage = {
 						role: "user",
 						content: verifyResult.correctivePrompt,
@@ -270,13 +336,7 @@ async function runLoop(
 				}
 			}
 
-			const nextTurnContext = {
-				message,
-				toolResults,
-				context: currentContext,
-				newMessages,
-			};
-			const nextTurnSnapshot = await config.prepareNextTurn?.(nextTurnContext);
+			const nextTurnSnapshot = await config.prepareNextTurn?.(turnContext);
 			if (nextTurnSnapshot) {
 				currentContext = nextTurnSnapshot.context ?? currentContext;
 				config = {
