@@ -66,24 +66,49 @@ export interface WarningSettings {
 }
 
 /**
- * Maker/checker/failsafe verification routing.
+ * Maker/checker/planner verification routing.
  *
  * When `checkerModel` is set, every turn that ends without tool calls (a
  * candidate final answer) is audited by the checker model. On conflict the
- * turn is rejected with corrective feedback and retried, optionally switching
- * to the failsafe model. Model refs accept "provider/id" (e.g.
- * "openrouter/z-ai/glm-5.2") or a bare model id resolved against the runtime.
+ * turn is retried by the maker with corrective feedback; on the Nth
+ * consecutive rejection the planner model decomposes the problem into a plan
+ * that the maker then executes (plan with a higher model, build with a lower
+ * one). Model refs accept "provider/id" (e.g. "openrouter/z-ai/glm-5.2") or a
+ * bare model id resolved against the runtime.
  */
 export interface VerifySettings {
 	/** Model ref used to audit the maker's answer (the checker). */
 	checkerModel?: string;
-	/** Model ref used when the checker conflicts (the failsafe). */
-	failsafeModel?: string;
+	/** Model ref that produces a plan when the maker/checker conflict (the planner). Never executes. */
+	plannerModel?: string;
 	/** Thinking level for the checker pass. */
 	checkerThinkingLevel?: ThinkingLevel;
+	/** Thinking level for the planner pass (default: "max"). */
+	plannerThinkingLevel?: ThinkingLevel;
+	/** Max consecutive rejections per answer before accepting it as-is (default: 2). Bounds checker/planner spend. */
+	maxRejections?: number;
+	/** Invoke the planner on the Nth consecutive rejection (default: 1 = immediately). Set above maxRejections to disable the planner. */
+	planAfterRejections?: number;
+	/** Skip audits for runs that used no tools (default: false). Avoids auditing conversational replies. */
+	auditOnlyAfterTools?: boolean;
+	/**
+	 * Allowlist of shell commands the checker may order the harness to run for
+	 * independent evidence (e.g. ["npm run check", "./test.sh"]). The harness —
+	 * not the maker — executes the matched command and returns raw output.
+	 * Default: [] (checker judges from the transcript only).
+	 */
+	verifierCommands?: string[];
 }
 
 export type DefaultProjectTrust = "ask" | "always" | "never";
+
+const THINKING_LEVEL_ORDER: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/** Clamp `level` up to at least `min` (when set). Used to enforce a configured thinking floor. */
+export function clampMinThinkingLevel(level: ThinkingLevel, min?: ThinkingLevel): ThinkingLevel {
+	if (!min) return level;
+	return THINKING_LEVEL_ORDER.indexOf(level) < THINKING_LEVEL_ORDER.indexOf(min) ? min : level;
+}
 
 export type TransportSetting = Transport;
 
@@ -109,6 +134,7 @@ export interface Settings {
 	defaultProvider?: string;
 	defaultModel?: string;
 	defaultThinkingLevel?: ThinkingLevel;
+	minThinkingLevel?: ThinkingLevel; // Thinking floor: sessions never run below this level (default: none)
 	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";
 	followUpMode?: "all" | "one-at-a-time";
@@ -730,6 +756,10 @@ export class SettingsManager {
 
 	getVerifySettings(): VerifySettings | undefined {
 		return this.settings.verify;
+	}
+
+	getMinThinkingLevel(): ThinkingLevel | undefined {
+		return this.settings.minThinkingLevel;
 	}
 
 	setSteeringMode(mode: "all" | "one-at-a-time"): void {
