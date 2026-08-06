@@ -141,6 +141,48 @@ export interface AgentLoopTurnUpdate {
 
 export interface PrepareNextTurnContext extends ShouldStopAfterTurnContext {}
 
+/**
+ * Context passed to a maker/checker/failsafe `verifyTurn` pass.
+ *
+ * Runs after a complete turn whose assistant message has NO tool calls (a
+ * candidate final answer). Useful for a multi-model loop: the maker produced
+ * the answer; the verifier (a second model) audits it; on conflict a failsafe
+ * model can re-attempt.
+ */
+export interface VerifyTurnContext {
+	/** The completed assistant message (no tool calls) to verify. */
+	message: AssistantMessage;
+	/** Current agent context after the turn's message has been appended. */
+	context: AgentContext;
+	/** Messages this loop invocation will return if it exits now. */
+	newMessages: AgentMessage[];
+	config: AgentLoopConfig;
+	signal?: AbortSignal;
+	/**
+	 * Run a second model over a fresh message list and return its final
+	 * assistant message. Use this to run the checker/failsafe model.
+	 */
+	runModel: (
+		model: Model<any>,
+		manualMessages: AgentMessage[],
+		opts?: { thinkingLevel?: ThinkingLevel },
+	) => Promise<AssistantMessage>;
+}
+
+/** Result of a maker/checker/failsafe `verifyTurn` pass. */
+export type TurnVerifyResult =
+	| { status: "verified" }
+	| {
+			status: "rejected";
+			/** User message injected before the next turn (the corrective feedback). */
+			correctivePrompt: string;
+			/** Optional model to switch to for the retry (e.g. the failsafe). */
+			model?: Model<any>;
+			/** Optional thinking level for the retry. */
+			thinkingLevel?: ThinkingLevel;
+	  }
+	| undefined;
+
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
 
@@ -215,6 +257,21 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * Contract: must not throw or reject. Throwing interrupts the low-level agent loop without producing a normal event sequence.
 	 */
 	shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext) => boolean | Promise<boolean>;
+
+	/**
+	 * Optional maker/checker/failsafe verifier pass.
+	 *
+	 * Called after a complete turn whose assistant message has NO tool calls
+	 * (a candidate final answer). Return `{ status: "verified" }` to stop the
+	 * loop. Return `{ status: "rejected", correctivePrompt, model?, thinkingLevel? }`
+	 * to inject corrective feedback and continue with the (optionally switched)
+	 * model for another turn.
+	 *
+	 * Contract: must not throw or reject. Return undefined to skip verification.
+	 * Keep the hook pure of side effects beyond calling `context.runModel` to
+	 * audit the answer with a second model.
+	 */
+	verifyTurn?: (context: VerifyTurnContext) => TurnVerifyResult | undefined | Promise<TurnVerifyResult | undefined>;
 
 	/**
 	 * Called after `turn_end` and before the loop decides whether another provider request should start.

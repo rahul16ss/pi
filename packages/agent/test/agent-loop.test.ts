@@ -10,7 +10,15 @@ import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { agentLoop, agentLoopContinue } from "../src/agent-loop.ts";
 import { setDefaultStreamFn } from "../src/index.ts";
-import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.ts";
+import type {
+	AgentContext,
+	AgentEvent,
+	AgentLoopConfig,
+	AgentMessage,
+	AgentTool,
+	TurnVerifyResult,
+	VerifyTurnContext,
+} from "../src/types.ts";
 
 // Mock stream for testing - mimics MockAssistantStream
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -1485,5 +1493,120 @@ describe("agentLoopContinue with AgentMessage", () => {
 		const messages = await stream.result();
 		expect(messages.length).toBe(1);
 		expect(messages[0].role).toBe("assistant");
+	});
+});
+
+describe("verifyTurn maker/checker/failsafe loop", () => {
+	function modelWithId(id: string): Model<any> {
+		const m = createModel();
+		return { ...m, id };
+	}
+
+	function textOf(message: AssistantMessage): string {
+		return message.content
+			.filter((c): c is Extract<AssistantMessage["content"][number], { type: "text" }> => c.type === "text")
+			.map((c) => c.text)
+			.join(" ");
+	}
+
+	// A streamFn that records every model it runs and yields one assistant
+	// message. The checker model (glm) delivers the audit verdict; with
+	// conflictOnce its first verdict is a CONFLICT, afterwards VERIFIED.
+	function recordingStreamFn(modelCalls: string[], conflictOnce = false) {
+		let glmCalls = 0;
+		return (model: Model<any>) => {
+			modelCalls.push(model.id);
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				let text = `answer from ${model.id}`;
+				if (/glm/.test(model.id)) {
+					text = conflictOnce && glmCalls++ === 0 ? "CONFLICT: needs more rigor" : "VERIFIED";
+				}
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text }]),
+				});
+			});
+			return stream;
+		};
+	}
+
+	// The hook shape used by both tests: the checker (glm) audits the maker's
+	// answer via ctx.runModel; on conflict the turn is retried with the
+	// failsafe (opus) at max thinking.
+	function gauntletVerifyTurn(ctx: VerifyTurnContext): Promise<TurnVerifyResult> {
+		return ctx
+			.runModel(
+				modelWithId("z-ai/glm-5.2"),
+				[{ role: "user", content: `Audit this answer: ${textOf(ctx.message)}`, timestamp: Date.now() }],
+				{ thinkingLevel: "high" },
+			)
+			.then((checker) =>
+				/VERIFIED/i.test(textOf(checker))
+					? { status: "verified" }
+					: {
+							status: "rejected",
+							correctivePrompt: "Conflict: rework the answer with maximum rigor.",
+							model: modelWithId("anthropic/claude-opus-5"),
+							thinkingLevel: "max",
+						},
+			);
+	}
+
+	it("accepts when checker verifies the maker answer (stops after verification)", async () => {
+		const modelCalls: string[] = [];
+		const config: AgentLoopConfig = {
+			model: modelWithId("deepseek/deepseek-v4-flash-0731"),
+			convertToLlm: identityConverter,
+			verifyTurn: gauntletVerifyTurn,
+		};
+
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+		const stream = agentLoop(
+			[createUserMessage("Solve the trading problem")],
+			context,
+			config,
+			undefined,
+			recordingStreamFn(modelCalls),
+		);
+		await stream.result();
+
+		// Maker (deepseek) answered, checker (glm) audited, loop stopped with no retry.
+		expect(modelCalls).toEqual(["deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.2"]);
+	});
+
+	it("escalates to failsafe on checker conflict, then verifies", async () => {
+		const modelCalls: string[] = [];
+		const config: AgentLoopConfig = {
+			model: modelWithId("deepseek/deepseek-v4-flash-0731"),
+			convertToLlm: identityConverter,
+			verifyTurn: gauntletVerifyTurn,
+		};
+
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+		const stream = agentLoop(
+			[createUserMessage("go")],
+			context,
+			config,
+			undefined,
+			recordingStreamFn(modelCalls, true),
+		);
+		const corrective: string[] = [];
+		for await (const event of stream) {
+			if (event.type === "message_start" && event.message.role === "user") {
+				corrective.push(typeof event.message.content === "string" ? event.message.content : "");
+			}
+		}
+		await stream.result();
+
+		// Maker answered, checker conflicted once, failsafe (opus) retried, then verified.
+		expect(modelCalls).toEqual([
+			"deepseek/deepseek-v4-flash-0731",
+			"z-ai/glm-5.2",
+			"anthropic/claude-opus-5",
+			"z-ai/glm-5.2",
+		]);
+		expect(corrective).toEqual(["go", "Conflict: rework the answer with maximum rigor."]);
 	});
 });

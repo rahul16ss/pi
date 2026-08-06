@@ -26,6 +26,8 @@ import type {
 	ShouldStopAfterTurnContext,
 	StreamFn,
 	ToolExecutionMode,
+	TurnVerifyResult,
+	VerifyTurnContext,
 } from "./types.ts";
 
 export type { QueueMode } from "./types.ts";
@@ -106,6 +108,11 @@ export interface AgentOptions {
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
 	shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext, signal?: AbortSignal) => boolean | Promise<boolean>;
+	/**
+	 * Optional maker/checker/failsafe verifier pass, run after a turn with no
+	 * tool calls. See `AgentLoopConfig.verifyTurn`.
+	 */
+	verifyTurn?: (context: VerifyTurnContext) => TurnVerifyResult | undefined | Promise<TurnVerifyResult | undefined>;
 	prepareNextTurn?: (
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
@@ -194,6 +201,9 @@ export class Agent {
 		context: ShouldStopAfterTurnContext,
 		signal?: AbortSignal,
 	) => boolean | Promise<boolean>;
+	public verifyTurn?: (
+		context: VerifyTurnContext,
+	) => TurnVerifyResult | undefined | Promise<TurnVerifyResult | undefined>;
 	public prepareNextTurn?: (
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
@@ -226,6 +236,7 @@ export class Agent {
 		this.beforeToolCall = runtimeOptions.beforeToolCall;
 		this.afterToolCall = runtimeOptions.afterToolCall;
 		this.shouldStopAfterTurn = runtimeOptions.shouldStopAfterTurn;
+		this.verifyTurn = runtimeOptions.verifyTurn;
 		this.prepareNextTurn = runtimeOptions.prepareNextTurn;
 		this.prepareNextTurnWithContext = runtimeOptions.prepareNextTurnWithContext;
 		this.steeringQueue = new PendingMessageQueue(runtimeOptions.steeringMode ?? "one-at-a-time");
@@ -456,6 +467,7 @@ export class Agent {
 			shouldStopAfterTurn: shouldStopAfterTurn
 				? async (context) => await shouldStopAfterTurn(context, this.signal)
 				: undefined,
+			verifyTurn: this.verifyTurn ? async (context) => await this.verifyTurn?.(context) : undefined,
 			prepareNextTurn:
 				this.prepareNextTurnWithContext || this.prepareNextTurn
 					? async (context) => {

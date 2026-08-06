@@ -7,6 +7,7 @@ import {
 	type AssistantMessage,
 	type Context,
 	EventStream,
+	type Model,
 	type ToolResultMessage,
 	validateToolArguments,
 } from "@earendil-works/pi-ai";
@@ -20,6 +21,8 @@ import type {
 	AgentToolCall,
 	AgentToolResult,
 	StreamFn,
+	ThinkingLevel,
+	TurnVerifyResult,
 } from "./types.ts";
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
@@ -223,6 +226,50 @@ async function runLoop(
 
 			await emit({ type: "turn_end", message, toolResults });
 
+			// ── Maker/checker/failsafe verifier pass (optional) ──────────────
+			// Runs only on a candidate final answer (no tool calls). The hook can
+			// audit it with a second model via context.runModel and either accept
+			// it (verified → stop) or reject it (inject corrective feedback,
+			// optionally switching model for the retry, e.g. a failsafe).
+			if (config.verifyTurn && toolCalls.length === 0) {
+				let verifyResult: TurnVerifyResult;
+				try {
+					verifyResult = await config.verifyTurn({
+						message,
+						context: currentContext,
+						newMessages,
+						config,
+						signal,
+						runModel: (m, manualMessages, opts) =>
+							runVerifierModel(m, manualMessages, config, signal, streamFunction, opts?.thinkingLevel),
+					});
+				} catch {
+					verifyResult = undefined; // honor the graceful contract
+				}
+
+				if (verifyResult?.status === "verified") {
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
+				if (verifyResult?.status === "rejected") {
+					const corrective: AgentMessage = {
+						role: "user",
+						content: verifyResult.correctivePrompt,
+						timestamp: Date.now(),
+					};
+					pendingMessages = pendingMessages.concat([corrective]);
+					if (verifyResult.model) config = { ...config, model: verifyResult.model };
+					if (verifyResult.thinkingLevel !== undefined) {
+						config = {
+							...config,
+							reasoning: verifyResult.thinkingLevel === "off" ? undefined : verifyResult.thinkingLevel,
+						};
+					}
+					hasMoreToolCalls = true; // re-enter inner loop to process the retry
+					continue;
+				}
+			}
+
 			const nextTurnContext = {
 				message,
 				toolResults,
@@ -272,6 +319,40 @@ async function runLoop(
 	}
 
 	await emit({ type: "agent_end", messages: newMessages });
+}
+
+/**
+ * Run a verifier (checker/failsafe) model over a fresh message list and return
+ * its final assistant message. Does not mutate the agent context. Used by the
+ * maker/checker/failsafe `verifyTurn` pass so a second model can audit the
+ * maker's answer before the loop settles.
+ */
+async function runVerifierModel(
+	model: Model<any>,
+	manualMessages: AgentMessage[],
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	streamFunction: StreamFn,
+	thinkingLevel?: ThinkingLevel,
+): Promise<AssistantMessage> {
+	const llmMessages = await config.convertToLlm(manualMessages);
+	const llmContext: Context = { systemPrompt: "", messages: llmMessages, tools: [] };
+	const resolvedApiKey = (config.getApiKey ? await config.getApiKey(model.provider) : undefined) || config.apiKey;
+	const reasoning = thinkingLevel === "off" ? undefined : (thinkingLevel ?? config.reasoning);
+	const response = await streamFunction(model, llmContext, {
+		...config,
+		apiKey: resolvedApiKey,
+		signal,
+		reasoning,
+	});
+
+	let finalMessage: AssistantMessage | undefined;
+	for await (const event of response) {
+		if (event.type === "done" || event.type === "error") {
+			finalMessage = await response.result();
+		}
+	}
+	return finalMessage ?? (await response.result());
 }
 
 /**
