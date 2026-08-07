@@ -232,6 +232,38 @@ async function runLoop(
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				// Provider error (not a user abort): offer a model fallback before
+				// killing the run — e.g. an upstream rate limit on one model.
+				if (message.stopReason === "error" && config.onTurnError) {
+					let fallback: Awaited<ReturnType<NonNullable<AgentLoopConfig["onTurnError"]>>>;
+					try {
+						fallback = await config.onTurnError({ message, context: currentContext, newMessages });
+					} catch {
+						fallback = undefined;
+					}
+					if (fallback?.model) {
+						// Drop the errored assistant message so the retry streams from a
+						// clean tail (it was already emitted to the UI as the error).
+						if (currentContext.messages[currentContext.messages.length - 1] === message) {
+							currentContext.messages.pop();
+						}
+						if (newMessages[newMessages.length - 1] === message) {
+							newMessages.pop();
+						}
+						config = {
+							...config,
+							model: fallback.model,
+							reasoning:
+								fallback.thinkingLevel === undefined
+									? config.reasoning
+									: fallback.thinkingLevel === "off"
+										? undefined
+										: fallback.thinkingLevel,
+						};
+						hasMoreToolCalls = true;
+						continue;
+					}
+				}
 				await emit({ type: "turn_end", message, toolResults: [] });
 				await emit({ type: "agent_end", messages: newMessages });
 				return;

@@ -731,6 +731,122 @@ describe("createVerifyRouting", () => {
 		expect(calls).toEqual(["moonshotai/kimi-k3", "moonshotai/kimi-k3"]);
 	});
 
+	it("falls back to plannerFallbackModel when the planner is rate-limited upstream", async () => {
+		const { routing, replies, runModel, auditLogPath } = setup({
+			plannerModel: "openrouter/openai/gpt-5.6-luna",
+			plannerFallbackModel: "openrouter/z-ai/glm-5.2",
+		});
+		replies["z-ai/glm-5.2"] = ["1. inspect\n2. implement\n3. verify"];
+		const errored = assistant("", "openai/gpt-5.6-luna");
+		(errored as { stopReason: string }).stopReason = "error";
+		(errored as { errorMessage?: string }).errorMessage = "temporarily rate-limited upstream";
+		const failingRunModel = async (model: Model<any>, msgs: AgentMessage[]) => {
+			if (model.id === "openai/gpt-5.6-luna") return errored;
+			return runModel(model, msgs);
+		};
+		const prep = await routing.beforeFirstTurn({
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [
+				{
+					role: "user",
+					content: "Implement a robust add() helper with tests and lint checks.",
+					timestamp: Date.now(),
+				},
+			],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel: failingRunModel,
+		} as unknown as BeforeFirstTurnContext);
+		expect(prep?.messages?.[0] && messageText(prep.messages[0] as any)).toContain("1. inspect");
+		const fallback = readAudit(auditLogPath).find((e) => e.event === "fallback");
+		expect(fallback?.stage).toBe("planner");
+		expect(fallback?.to).toBe("z-ai/glm-5.2");
+	});
+
+	it("falls back to checkerFallbackModel when the checker errors, and never re-asks an errored checker", async () => {
+		const { routing, replies, runModel, auditLogPath } = setup({
+			planFirst: false,
+			checkerFallbackModel: "openrouter/moonshotai/kimi-k3",
+			checkerModel: "openrouter/z-ai/glm-5.2",
+		});
+		replies["moonshotai/kimi-k3"] = ["All good. VERIFIED"];
+		const failingRunModel = async (model: Model<any>, msgs: AgentMessage[]) => {
+			if (model.id === "z-ai/glm-5.2") {
+				const errored = assistant("", "z-ai/glm-5.2");
+				(errored as { stopReason: string }).stopReason = "error";
+				(errored as { errorMessage?: string }).errorMessage = "rate-limited";
+				return errored;
+			}
+			return runModel(model, msgs);
+		};
+		const verified = await routing.verifyTurn({
+			kind: "final",
+			message: assistant("done"),
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [
+				{ role: "user", content: "Build add() with tests.", timestamp: Date.now() },
+				toolResult("bash", "npm test ok"),
+			],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel: failingRunModel,
+		} as unknown as VerifyTurnContext);
+		expect(verified?.status).toBe("verified");
+		const audit = readAudit(auditLogPath);
+		expect(audit.find((e) => e.event === "fallback")?.to).toBe("moonshotai/kimi-k3");
+		expect(audit.find((e) => e.event === "audit")?.checker).toBe("moonshotai/kimi-k3");
+	});
+
+	it("skips the audit gracefully when checker and fallback are both unavailable", async () => {
+		const { routing, auditLogPath } = setup({ planFirst: false, checkerFallbackModel: undefined });
+		const alwaysErr = async (model: Model<any>) => {
+			const errored = assistant("", model.id);
+			(errored as { stopReason: string }).stopReason = "error";
+			(errored as { errorMessage?: string }).errorMessage = "rate-limited";
+			return errored;
+		};
+		const result = await routing.verifyTurn({
+			kind: "final",
+			message: assistant("done"),
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [
+				{ role: "user", content: "Build add() with tests.", timestamp: Date.now() },
+				toolResult("bash", "ok"),
+			],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel: alwaysErr,
+		} as unknown as VerifyTurnContext);
+		expect(result).toBeUndefined();
+		expect(readAudit(auditLogPath).some((e) => e.reason === "ambiguous-verdict")).toBe(true);
+	});
+
+	it("onTurnError swaps a rate-limited maker to the fallback, capped per run", async () => {
+		const { routing, auditLogPath } = setup({ makerFallbackModel: "openrouter/moonshotai/kimi-k3" });
+		const errored = assistant("", "openai/gpt-5.6-luna");
+		(errored as { stopReason: string }).stopReason = "error";
+		(errored as { errorMessage?: string }).errorMessage = "temporarily rate-limited upstream";
+		const ctx = {
+			message: errored,
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [],
+		} as unknown as Parameters<typeof routing.onTurnError>[0];
+
+		// Same-model guard: if the fallback itself is what failed, give up.
+		const failedFallback = assistant("", "moonshotai/kimi-k3");
+		(failedFallback as { stopReason: string }).stopReason = "error";
+		expect(
+			await routing.onTurnError({ ...(ctx as object), message: failedFallback } as Parameters<
+				typeof routing.onTurnError
+			>[0]),
+		).toBeUndefined();
+
+		const first = await routing.onTurnError(ctx);
+		expect(first?.model?.id).toBe("moonshotai/kimi-k3");
+		const second = await routing.onTurnError(ctx);
+		expect(second?.model?.id).toBe("moonshotai/kimi-k3");
+		// Capped: a third failure in the same run ends it instead of looping.
+		expect(await routing.onTurnError(ctx)).toBeUndefined();
+		expect(readAudit(auditLogPath).filter((e) => e.event === "maker-fallback").length).toBe(2);
+	});
+
 	it("returns undefined when checker model cannot be resolved", () => {
 		const dir = mkdtempSync(join(tmpdir(), "pi-verify-"));
 		dirs.push(dir);

@@ -194,6 +194,14 @@ export interface BeforeFirstTurnResult {
 	thinkingLevel?: ThinkingLevel;
 }
 
+/** Context for `onTurnError`: an assistant turn ended with a provider error after retries. */
+export interface TurnErrorContext {
+	/** The errored assistant message (stopReason "error"). */
+	message: AssistantMessage;
+	context: AgentContext;
+	newMessages: AgentMessage[];
+}
+
 /** Result of a maker/checker/planner `verifyTurn` pass. */
 export type TurnVerifyResult =
 	| {
@@ -331,6 +339,18 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	beforeFirstTurn?: (
 		context: BeforeFirstTurnContext,
 	) => BeforeFirstTurnResult | undefined | Promise<BeforeFirstTurnResult | undefined>;
+
+	/**
+	 * Called when an assistant turn ends with `stopReason: "error"` after the
+	 * provider retry budget is exhausted (never for user aborts). Return a
+	 * replacement model to drop the errored message and retry the turn on it
+	 * (e.g. a rate-limit fallback); return undefined to end the run as before.
+	 *
+	 * Contract: must not throw or reject. Return undefined when unsure.
+	 */
+	onTurnError?: (
+		context: TurnErrorContext,
+	) => AgentLoopTurnUpdate | undefined | Promise<AgentLoopTurnUpdate | undefined>;
 
 	/**
 	 * Called after `turn_end` and before the loop decides whether another provider request should start.

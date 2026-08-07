@@ -28,10 +28,12 @@ import { execSync } from "node:child_process";
 import { appendFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type {
+	AgentLoopTurnUpdate,
 	AgentMessage,
 	BeforeFirstTurnContext,
 	BeforeFirstTurnResult,
 	ThinkingLevel,
+	TurnErrorContext,
 	TurnVerifyResult,
 	VerifyTurnContext,
 } from "@earendil-works/pi-agent-core";
@@ -61,6 +63,12 @@ export interface VerifyRoutingHooks {
 	beforeFirstTurn: (ctx: BeforeFirstTurnContext) => Promise<BeforeFirstTurnResult | undefined>;
 	shouldCheckpoint: (ctx: { toolTurnCount: number }) => boolean;
 	verifyTurn: (ctx: VerifyTurnContext) => Promise<TurnVerifyResult | undefined>;
+	onTurnError: (ctx: TurnErrorContext) => Promise<AgentLoopTurnUpdate | undefined>;
+}
+
+/** A verifier reply that is a provider failure, not a verdict. */
+export function isErrorReply(m: AssistantMessage): boolean {
+	return m.stopReason === "error" || Boolean(m.errorMessage && m.errorMessage.trim().length > 0);
 }
 
 export interface CreateVerifyRoutingOptions {
@@ -294,6 +302,7 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 	let checkpointsSoFar = 0;
 	let alreadyPlanned = false;
 	let makerEscalated = false;
+	let makerFallbacksUsed = 0;
 	let tier: VerifyTier = "standard";
 	const runCost = { calls: 0, tokensIn: 0, tokensOut: 0, costUsd: 0 };
 
@@ -306,11 +315,47 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 		checkpointsSoFar = 0;
 		alreadyPlanned = false;
 		makerEscalated = false;
+		makerFallbacksUsed = 0;
 		tier = "standard";
 		runCost.calls = 0;
 		runCost.tokensIn = 0;
 		runCost.tokensOut = 0;
 		runCost.costUsd = 0;
+	};
+
+	/**
+	 * Run a verifier call with an availability fallback: on a provider error
+	 * (upstream rate limit etc.), retry once on the configured fallback model.
+	 * Returns the reply plus the model that actually produced it so follow-up
+	 * calls in the same audit stay on the working model.
+	 */
+	const callWithFallback = async (
+		runModel: VerifyTurnContext["runModel"],
+		primary: Model<any>,
+		fallbackRef: string | undefined,
+		messages: AgentMessage[],
+		thinkingLevel: ThinkingLevel | undefined,
+		stage: string,
+	): Promise<{ reply: AssistantMessage; model: Model<any> }> => {
+		let reply: AssistantMessage | undefined;
+		let failure = "";
+		try {
+			reply = await runModel(primary, messages, { thinkingLevel });
+			trackCost(reply);
+			if (!isErrorReply(reply)) return { reply, model: primary };
+			failure = reply.errorMessage ?? reply.stopReason;
+		} catch (error) {
+			failure = error instanceof Error ? error.message : String(error);
+		}
+		const fallback = resolveModel(fallbackRef);
+		if (!fallback || fallback.id === primary.id) {
+			if (reply) return { reply, model: primary };
+			throw new Error(failure);
+		}
+		logVerify({ event: "fallback", stage, from: primary.id, to: fallback.id, err: failure.slice(0, 160) });
+		const second = await runModel(fallback, messages, { thinkingLevel });
+		trackCost(second);
+		return { reply: second, model: fallback };
 	};
 
 	const trackCost = (m: AssistantMessage): { tokensIn: number; tokensOut: number; costUsd: number } => {
@@ -496,8 +541,31 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 		});
 		auditMessages.push({ role: "user", content: auditPrompt, timestamp: Date.now() });
 
-		let audit = await vctx.runModel(activeChecker, auditMessages, { thinkingLevel });
-		trackCost(audit);
+		let audit: AssistantMessage;
+		let workingChecker = activeChecker;
+		try {
+			const first = await callWithFallback(
+				vctx.runModel,
+				activeChecker,
+				verify.checkerFallbackModel,
+				auditMessages,
+				thinkingLevel,
+				kind === "checkpoint" ? "checkpoint-checker" : "final-checker",
+			);
+			audit = first.reply;
+			workingChecker = first.model;
+		} catch (error) {
+			// Both checker and fallback unavailable: skip the audit (fail open,
+			// logged) instead of blocking the run on a provider outage.
+			logVerify({
+				event: "audit-unavailable",
+				kind,
+				tier,
+				checker: activeChecker.id,
+				err: error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200),
+			});
+			return { verdict: "ambiguous", auditText: "", ran: null };
+		}
 		let auditText = messageText(audit);
 
 		const ran: string[] = [];
@@ -511,13 +579,13 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 				content: `Output of \`${requested}\` (run by the harness, tail):\n${output}`,
 				timestamp: Date.now(),
 			});
-			audit = await vctx.runModel(activeChecker, auditMessages, { thinkingLevel });
+			audit = await vctx.runModel(workingChecker, auditMessages, { thinkingLevel });
 			trackCost(audit);
 			auditText = messageText(audit);
 		}
 
 		let verdict = classifyCheckerVerdict(auditText);
-		if (verdict === "ambiguous") {
+		if (verdict === "ambiguous" && !isErrorReply(audit)) {
 			// One strict re-ask: an ambiguous verdict otherwise drops the audit
 			// silently, wasting the checker call.
 			auditMessages.push({
@@ -526,7 +594,7 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 					'Your reply did not contain a clear verdict. Reply EXACTLY "VERIFIED", or state the specific problem followed by the word "CONFLICT".',
 				timestamp: Date.now(),
 			});
-			audit = await vctx.runModel(activeChecker, auditMessages, { thinkingLevel });
+			audit = await vctx.runModel(workingChecker, auditMessages, { thinkingLevel });
 			trackCost(audit);
 			auditText = messageText(audit);
 			verdict = classifyCheckerVerdict(auditText);
@@ -536,7 +604,7 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 			event: "audit",
 			kind,
 			tier,
-			checker: activeChecker.id,
+			checker: workingChecker.id,
 			verdict,
 			ran: ran.length > 0 ? ran : null,
 			stop: audit.stopReason,
@@ -554,25 +622,32 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 		const plannerRef = verify.strongPlannerModel ?? verify.plannerModel;
 		const planner = resolveModel(plannerRef);
 		if (!planner) return "";
-		const plan = await vctx.runModel(
-			planner,
-			[
-				...vctx.context.messages,
-				{
-					role: "user",
-					content:
-						`A checker rejected the previous work. Feedback: ${feedback.slice(0, 800)}\n\n` +
-						"You are a senior planner. Do NOT answer the task yourself. Break the problem down into " +
-						"a short, concrete, step-by-step plan that a maker model can execute to produce " +
-						"a correct result. Address the checker's feedback and require a DIFFERENT strategy from " +
-						"the rejected approach.",
-					timestamp: Date.now(),
-				},
-			],
-			{ thinkingLevel: verify.strongPlannerThinkingLevel ?? verify.plannerThinkingLevel ?? "max" },
-		);
-		trackCost(plan);
-		return messageText(plan);
+		try {
+			const { reply: plan } = await callWithFallback(
+				vctx.runModel,
+				planner,
+				verify.plannerFallbackModel,
+				[
+					...vctx.context.messages,
+					{
+						role: "user",
+						content:
+							`A checker rejected the previous work. Feedback: ${feedback.slice(0, 800)}\n\n` +
+							"You are a senior planner. Do NOT answer the task yourself. Break the problem down into " +
+							"a short, concrete, step-by-step plan that a maker model can execute to produce " +
+							"a correct result. Address the checker's feedback and require a DIFFERENT strategy from " +
+							"the rejected approach.",
+						timestamp: Date.now(),
+					},
+				],
+				verify.strongPlannerThinkingLevel ?? verify.plannerThinkingLevel ?? "max",
+				"re-planner",
+			);
+			return messageText(plan);
+		} catch {
+			// Planner and fallback both unavailable: retry without a plan.
+			return "";
+		}
 	};
 
 	const rejectWithOptionalPlan = async (
@@ -687,8 +762,10 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 
 			alreadyPlanned = true;
 			try {
-				const plan = await ctx.runModel(
+				const { reply: plan } = await callWithFallback(
+					ctx.runModel,
 					planner,
+					verify.plannerFallbackModel,
 					[
 						{
 							role: "user",
@@ -712,9 +789,10 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 							timestamp: Date.now(),
 						},
 					],
-					{ thinkingLevel: view.plannerThinking },
+					view.plannerThinking,
+					"planner",
 				);
-				const cost = trackCost(plan);
+				const cost = usageFields(plan);
 				const planText = messageText(plan);
 				if (!planText) {
 					logVerify({ event: "plan-skipped", reason: "empty-plan", planner: view.plannerRef, tier });
@@ -766,6 +844,24 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 				maxCheckpoints,
 				backoff,
 			}),
+
+		onTurnError: async ({ message }) => {
+			// A maker turn died on a provider error after retries. Swap to the
+			// availability fallback and retry instead of killing the run.
+			if (makerFallbacksUsed >= 2) return undefined;
+			const failedId = (message as { model?: string }).model ?? "";
+			const fallback = resolveModel(verify.makerFallbackModel);
+			if (!fallback || fallback.id === failedId) return undefined;
+			makerFallbacksUsed++;
+			logVerify({
+				event: "maker-fallback",
+				from: failedId || null,
+				to: fallback.id,
+				n: makerFallbacksUsed,
+				err: message.errorMessage?.slice(0, 160) ?? null,
+			});
+			return { model: fallback };
+		},
 
 		verifyTurn: async (vctx) => {
 			const kind: VerifyKind = vctx.kind ?? "final";

@@ -162,6 +162,14 @@ export interface VerifySettings {
 	/** Max harness-executed RUN: commands per checker audit (default: 2). */
 	maxCheckerRuns?: number;
 	/**
+	 * Availability fallbacks: when a stage's model fails with a provider error
+	 * (e.g. upstream rate limit) after retries, retry once on the fallback.
+	 * Maker fallback also rescues errored maker turns instead of ending the run.
+	 */
+	plannerFallbackModel?: string;
+	makerFallbackModel?: string;
+	checkerFallbackModel?: string;
+	/**
 	 * Once retries escalate the maker, keep the escalated maker for the rest of
 	 * the run instead of demoting on the next verified checkpoint (default:
 	 * true). Prevents fail→escalate→pass→demote→fail ping-pong.

@@ -1636,6 +1636,80 @@ describe("verifyTurn maker/checker/failsafe loop", () => {
 		expect(noticeSeenBeforeEnd).toBe(true);
 		expect(messages.some((m) => m.role === "user" && String(m.content).includes("[VERIFY] UNVERIFIED"))).toBe(true);
 	});
+
+	it("onTurnError swaps models and retries the errored turn instead of ending the run", async () => {
+		const modelCalls: string[] = [];
+		const failingThenOkStreamFn = (model: Model<any>) => {
+			modelCalls.push(model.id);
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (model.id === "openai/gpt-5.6-luna") {
+					const errored = {
+						...createAssistantMessage([], "error"),
+						model: model.id,
+						errorMessage: "temporarily rate-limited upstream",
+					};
+					stream.push({ type: "done", reason: "stop", message: errored });
+				} else {
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: `answer from ${model.id}` }]),
+					});
+				}
+			});
+			return stream;
+		};
+
+		const config: AgentLoopConfig = {
+			model: modelWithId("openai/gpt-5.6-luna"),
+			convertToLlm: identityConverter,
+			onTurnError: async ({ message }) => {
+				expect(message.stopReason).toBe("error");
+				return { model: modelWithId("moonshotai/kimi-k3") };
+			},
+		};
+
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+		const stream = agentLoop([createUserMessage("go")], context, config, undefined, failingThenOkStreamFn);
+		const messages = await stream.result();
+
+		expect(modelCalls).toEqual(["openai/gpt-5.6-luna", "moonshotai/kimi-k3"]);
+		// The errored assistant message is dropped; the run ends with the fallback's answer.
+		const assistants = messages.filter((m) => m.role === "assistant");
+		expect(assistants.length).toBe(1);
+		expect((assistants[0] as AssistantMessage).stopReason).toBe("stop");
+	});
+
+	it("onTurnError is not consulted for user aborts", async () => {
+		const modelCalls: string[] = [];
+		const abortedStreamFn = (model: Model<any>) => {
+			modelCalls.push(model.id);
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: { ...createAssistantMessage([], "aborted"), model: model.id },
+				});
+			});
+			return stream;
+		};
+		let consulted = false;
+		const config: AgentLoopConfig = {
+			model: modelWithId("openai/gpt-5.6-luna"),
+			convertToLlm: identityConverter,
+			onTurnError: async () => {
+				consulted = true;
+				return { model: modelWithId("moonshotai/kimi-k3") };
+			},
+		};
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+		const stream = agentLoop([createUserMessage("go")], context, config, undefined, abortedStreamFn);
+		await stream.result();
+		expect(consulted).toBe(false);
+		expect(modelCalls).toEqual(["openai/gpt-5.6-luna"]);
+	});
 });
 
 describe("mid-build plan/checkpoint routing in agent loop", () => {

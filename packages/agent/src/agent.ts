@@ -28,6 +28,7 @@ import type {
 	ShouldStopAfterTurnContext,
 	StreamFn,
 	ToolExecutionMode,
+	TurnErrorContext,
 	TurnVerifyResult,
 	VerifyTurnContext,
 } from "./types.ts";
@@ -123,6 +124,10 @@ export interface AgentOptions {
 	beforeFirstTurn?: (
 		context: BeforeFirstTurnContext,
 	) => BeforeFirstTurnResult | undefined | Promise<BeforeFirstTurnResult | undefined>;
+	/** Provider-error model fallback. See `AgentLoopConfig.onTurnError`. */
+	onTurnError?: (
+		context: TurnErrorContext,
+	) => AgentLoopTurnUpdate | undefined | Promise<AgentLoopTurnUpdate | undefined>;
 	prepareNextTurn?: (
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
@@ -221,6 +226,9 @@ export class Agent {
 	public beforeFirstTurn?: (
 		context: BeforeFirstTurnContext,
 	) => BeforeFirstTurnResult | undefined | Promise<BeforeFirstTurnResult | undefined>;
+	public onTurnError?: (
+		context: TurnErrorContext,
+	) => AgentLoopTurnUpdate | undefined | Promise<AgentLoopTurnUpdate | undefined>;
 	public prepareNextTurn?: (
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
@@ -256,6 +264,7 @@ export class Agent {
 		this.verifyTurn = runtimeOptions.verifyTurn;
 		this.shouldCheckpoint = runtimeOptions.shouldCheckpoint;
 		this.beforeFirstTurn = runtimeOptions.beforeFirstTurn;
+		this.onTurnError = runtimeOptions.onTurnError;
 		this.prepareNextTurn = runtimeOptions.prepareNextTurn;
 		this.prepareNextTurnWithContext = runtimeOptions.prepareNextTurnWithContext;
 		this.steeringQueue = new PendingMessageQueue(runtimeOptions.steeringMode ?? "one-at-a-time");
@@ -491,6 +500,7 @@ export class Agent {
 				? async (context) => Boolean(await this.shouldCheckpoint?.(context, this.signal))
 				: undefined,
 			beforeFirstTurn: this.beforeFirstTurn ? async (context) => await this.beforeFirstTurn?.(context) : undefined,
+			onTurnError: this.onTurnError ? async (context) => await this.onTurnError?.(context) : undefined,
 			prepareNextTurn:
 				this.prepareNextTurnWithContext || this.prepareNextTurn
 					? async (context) => {

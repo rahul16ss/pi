@@ -394,6 +394,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		: undefined;
 
+	const wrappedOnTurnError = routing
+		? async (ctx: Parameters<NonNullable<typeof routing.onTurnError>>[0]) => {
+				const update = await routing.onTurnError(ctx);
+				if (update?.model) {
+					syncSessionModel(update.model, update.thinkingLevel);
+				}
+				return update;
+			}
+		: undefined;
+
 	agent = new Agent({
 		initialState: {
 			systemPrompt: "",
@@ -460,6 +470,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		beforeFirstTurn: wrappedBeforeFirstTurn,
 		shouldCheckpoint: routing ? (ctx) => routing.shouldCheckpoint(ctx) : undefined,
 		verifyTurn: wrappedVerifyTurn,
+		onTurnError: wrappedOnTurnError,
 		transport: settingsManager.getTransport(),
 		thinkingBudgets: settingsManager.getThinkingBudgets(),
 		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
