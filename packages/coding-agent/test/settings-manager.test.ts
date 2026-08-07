@@ -111,6 +111,21 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("maxOutputTokens", () => {
+		it("defaults to 32768, honors explicit values, and 0 disables the cap", () => {
+			const settingsPath = join(agentDir, "settings.json");
+
+			writeFileSync(settingsPath, JSON.stringify({}));
+			expect(SettingsManager.create(projectDir, agentDir).getMaxOutputTokens()).toBe(32768);
+
+			writeFileSync(settingsPath, JSON.stringify({ maxOutputTokens: 8192 }));
+			expect(SettingsManager.create(projectDir, agentDir).getMaxOutputTokens()).toBe(8192);
+
+			writeFileSync(settingsPath, JSON.stringify({ maxOutputTokens: 0 }));
+			expect(SettingsManager.create(projectDir, agentDir).getMaxOutputTokens()).toBeUndefined();
+		});
+	});
+
 	describe("packages migration", () => {
 		it("should keep local-only extensions in extensions array", () => {
 			const settingsPath = join(agentDir, "settings.json");

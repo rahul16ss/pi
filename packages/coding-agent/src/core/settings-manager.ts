@@ -263,6 +263,14 @@ export interface Settings {
 	doubleEscapeAction?: "fork" | "tree" | "none"; // Action for double-escape with empty editor (default: "tree")
 	treeFilterMode?: "default" | "no-tools" | "user-only" | "labeled-only" | "all"; // Default filter when opening /tree
 	thinkingBudgets?: ThinkingBudgetsSettings; // Custom token budgets for thinking levels
+	/**
+	 * Cap on requested output tokens per provider request (default: 32768,
+	 * 0 = model maximum). Providers that pre-authorize credit against
+	 * max_tokens (e.g. OpenRouter key limits) reject worst-case requests like
+	 * a 128k ceiling; most turns need a fraction of that. Reasoning tokens
+	 * share this ceiling on effort-based APIs.
+	 */
+	maxOutputTokens?: number;
 	verify?: VerifySettings; // Maker/checker/failsafe verification routing (default: disabled)
 	editorPaddingX?: number; // Horizontal padding for input editor (default: 0)
 	outputPad?: 0 | 1; // Horizontal padding for chat message output (default: 1)
@@ -1213,6 +1221,13 @@ export class SettingsManager {
 
 	getThinkingBudgets(): ThinkingBudgetsSettings | undefined {
 		return this.settings.thinkingBudgets;
+	}
+
+	/** Per-request output-token cap. Undefined means "use the model maximum" (maxOutputTokens: 0). */
+	getMaxOutputTokens(): number | undefined {
+		const configured = this.settings.maxOutputTokens;
+		if (configured === 0) return undefined;
+		return configured ?? 32768;
 	}
 
 	getShowImages(): boolean {

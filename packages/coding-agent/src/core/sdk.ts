@@ -422,8 +422,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const websocketConnectTimeoutMs =
 				options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
 			const headerRunner = extensionRunnerRef.current;
+			// Cap requested output tokens: providers that pre-authorize credit
+			// against max_tokens (OpenRouter key limits) reject worst-case
+			// model-maximum requests long before actual usage warrants it.
+			const cappedMaxTokens = (() => {
+				const cap = settingsManager.getMaxOutputTokens();
+				if (cap === undefined) return options?.maxTokens;
+				return Math.min(options?.maxTokens ?? cap, cap, model.maxTokens);
+			})();
 			return modelRuntime.streamSimple(model, context, {
 				...options,
+				maxTokens: cappedMaxTokens,
 				timeoutMs,
 				websocketConnectTimeoutMs,
 				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
