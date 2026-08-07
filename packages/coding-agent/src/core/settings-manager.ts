@@ -130,8 +130,63 @@ export interface VerifySettings {
 	 * disabled).
 	 */
 	checkpointEveryToolTurns?: number;
-	/** Max mid-build checkpoints per agent run (default: 3). */
+	/** Max mid-build checkpoints per agent run (default: 8). */
 	maxCheckpointsPerRun?: number;
+	/**
+	 * Checkpoint cadence. "geometric" (default) doubles the interval after each
+	 * audit (N, 2N, 4N …) so long runs never go unaudited but audit count stays
+	 * logarithmic. "fixed" audits every N tool turns like before.
+	 */
+	checkpointBackoff?: "fixed" | "geometric";
+	/**
+	 * Task-complexity triage: one cheap classification call at run start routes
+	 * the run to a tier (trivial | standard | hard). Enabled by default when
+	 * routing is active; set `enabled: false` to gate purely on prompt length.
+	 */
+	triage?: {
+		enabled?: boolean;
+		/** Model ref for the triage call (default: the base maker). */
+		model?: string;
+	};
+	/**
+	 * Stronger planner used for hard-tier plans and post-rejection re-plans
+	 * (default: plannerModel).
+	 */
+	strongPlannerModel?: string;
+	strongPlannerThinkingLevel?: ThinkingLevel;
+	/** Per-tier stage overrides applied when triage classifies a run. */
+	tiers?: {
+		trivial?: VerifyTierOverrides;
+		hard?: VerifyTierOverrides;
+	};
+	/** Max harness-executed RUN: commands per checker audit (default: 2). */
+	maxCheckerRuns?: number;
+	/**
+	 * Once retries escalate the maker, keep the escalated maker for the rest of
+	 * the run instead of demoting on the next verified checkpoint (default:
+	 * true). Prevents fail→escalate→pass→demote→fail ping-pong.
+	 */
+	stickyEscalation?: boolean;
+}
+
+/**
+ * Stage overrides for one triage tier. Anything unset falls back to the
+ * tier's built-in defaults, then to the top-level verify settings.
+ */
+export interface VerifyTierOverrides {
+	makerModel?: string;
+	makerThinkingLevel?: ThinkingLevel;
+	plannerModel?: string;
+	plannerThinkingLevel?: ThinkingLevel;
+	/** Skip the plan-first pass for this tier (default: true for trivial). */
+	skipPlanner?: boolean;
+	checkerModel?: string;
+	checkerThinkingLevel?: ThinkingLevel;
+	checkpointCheckerModel?: string;
+	checkpointCheckerThinkingLevel?: ThinkingLevel;
+	checkpointEveryToolTurns?: number;
+	escalationMakerModel?: string;
+	escalationMakerThinkingLevel?: ThinkingLevel;
 }
 
 export type DefaultProjectTrust = "ask" | "always" | "never";

@@ -8,7 +8,10 @@ import type { VerifySettings } from "../src/core/settings-manager.ts";
 import {
 	checkerRefForKind,
 	classifyCheckerVerdict,
+	classifyTriageTier,
 	createVerifyRouting,
+	EXCELLENCE_CHARTER,
+	isConversationalPrompt,
 	messageText,
 	shouldEscalateMaker,
 	shouldPlanFirst,
@@ -84,6 +87,27 @@ describe("classifyCheckerVerdict", () => {
 	});
 });
 
+describe("classifyTriageTier", () => {
+	it("parses the first clear tier token, case-insensitively", () => {
+		expect(classifyTriageTier("TRIVIAL")).toBe("trivial");
+		expect(classifyTriageTier("This is a STANDARD task.")).toBe("standard");
+		expect(classifyTriageTier("hard")).toBe("hard");
+		expect(classifyTriageTier("Verdict: HARD — concurrency involved")).toBe("hard");
+		expect(classifyTriageTier("no idea")).toBeUndefined();
+		expect(classifyTriageTier("")).toBeUndefined();
+	});
+});
+
+describe("isConversationalPrompt", () => {
+	it("catches greetings and very short prompts, not real short tasks", () => {
+		expect(isConversationalPrompt("hi")).toBe(true);
+		expect(isConversationalPrompt("thanks, looks great!")).toBe(true);
+		expect(isConversationalPrompt("ok")).toBe(true);
+		expect(isConversationalPrompt("fix the race condition in session resume")).toBe(false);
+		expect(isConversationalPrompt("refactor the settings loader to be async")).toBe(false);
+	});
+});
+
 describe("shouldEscalateMaker", () => {
 	it("escalates on/after the configured rejection count", () => {
 		expect(shouldEscalateMaker({ rejections: 1, escalateAfterRejections: 1 })).toBe(true);
@@ -108,6 +132,17 @@ describe("checkerRefForKind", () => {
 });
 
 describe("shouldRunCheckpoint", () => {
+	it("geometric backoff audits at N, 2N, 4N and never leaves a long tail unaudited", () => {
+		const geo = (toolTurnCount: number, checkpointsSoFar: number) =>
+			shouldRunCheckpoint({ toolTurnCount, everyN: 6, checkpointsSoFar, maxCheckpoints: 8, backoff: "geometric" });
+		expect(geo(5, 0)).toBe(false);
+		expect(geo(6, 0)).toBe(true);
+		expect(geo(11, 1)).toBe(false);
+		expect(geo(12, 1)).toBe(true);
+		expect(geo(24, 2)).toBe(true);
+		expect(geo(48, 3)).toBe(true); // fixed cadence with a cap of 4 would have gone dark here
+	});
+
 	it("fires every N tool turns within the budget", () => {
 		expect(shouldRunCheckpoint({ toolTurnCount: 2, everyN: 2, checkpointsSoFar: 0, maxCheckpoints: 3 })).toBe(true);
 		expect(shouldRunCheckpoint({ toolTurnCount: 4, everyN: 2, checkpointsSoFar: 1, maxCheckpoints: 3 })).toBe(true);
@@ -207,6 +242,7 @@ describe("createVerifyRouting", () => {
 				planAfterRejections: 2,
 				escalateAfterRejections: 1,
 				auditOnlyAfterTools: true,
+				triage: { enabled: false },
 				...settings,
 			},
 			makerModel: modelWithId("deepseek/deepseek-v4-flash-0731"),
@@ -280,7 +316,7 @@ describe("createVerifyRouting", () => {
 		expect(calls).toEqual([]);
 	});
 
-	it("skips planFirst for short conversational prompts", async () => {
+	it("skips planFirst for short conversational prompts (heuristic trivial tier)", async () => {
 		const { routing, calls, runModel, auditLogPath } = setup();
 		const prep = await routing.beforeFirstTurn({
 			context: { systemPrompt: "", messages: [], tools: [] },
@@ -288,9 +324,14 @@ describe("createVerifyRouting", () => {
 			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
 			runModel,
 		} as unknown as BeforeFirstTurnContext);
-		expect(prep).toBeUndefined();
+		// No planner or triage call runs, but the trivial tier still routes the maker.
+		expect(prep?.messages).toBeUndefined();
+		expect(prep?.model?.id).toBe("deepseek/deepseek-v4-flash-0731");
+		expect(prep?.thinkingLevel).toBe("medium");
 		expect(calls).toEqual([]);
-		expect(readAudit(auditLogPath).some((e) => e.event === "plan-skipped")).toBe(true);
+		const audit = readAudit(auditLogPath);
+		expect(audit.some((e) => e.event === "triage" && e.tier === "trivial" && e.via === "heuristic")).toBe(true);
+		expect(audit.some((e) => e.event === "plan-skipped" && e.reason === "trivial-tier")).toBe(true);
 	});
 
 	it("schedules checkpoints every N tool turns up to max", () => {
@@ -463,6 +504,198 @@ describe("createVerifyRouting", () => {
 		}
 		const exhausted = readAudit(auditLogPath).find((e) => e.event === "budget-exhausted");
 		expect(exhausted?.accepted).toBe("unverified");
+	});
+
+	it("triage HARD routes the run to the strong planner and the stronger maker", async () => {
+		const { routing, calls, replies, runModel, auditLogPath } = setup({ triage: { enabled: true } });
+		replies["deepseek/deepseek-v4-flash-0731"] = ["HARD"];
+		const prep = await routing.beforeFirstTurn({
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [
+				{
+					role: "user",
+					content: "Rework session resume to survive provider failover races.",
+					timestamp: Date.now(),
+				},
+			],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel,
+		} as unknown as BeforeFirstTurnContext);
+		// Triage on the cheap maker, plan on the (strong) planner, make on the escalation-class maker.
+		expect(calls).toEqual(["deepseek/deepseek-v4-flash-0731", "anthropic/claude-opus-5"]);
+		expect(prep?.model?.id).toBe("openai/gpt-5.6-luna");
+		expect(prep?.thinkingLevel).toBe("high");
+		expect(readAudit(auditLogPath).some((e) => e.event === "triage" && e.tier === "hard")).toBe(true);
+	});
+
+	it("triage TRIVIAL skips the planner and checkpoints, and finals on the cheap checker", async () => {
+		const { routing, calls, replies, runModel } = setup({ triage: { enabled: true } });
+		replies["deepseek/deepseek-v4-flash-0731"] = ["TRIVIAL"];
+		const prep = await routing.beforeFirstTurn({
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [
+				{
+					role: "user",
+					content: "Bump the copyright year in the site footer to 2026 please.",
+					timestamp: Date.now(),
+				},
+			],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel,
+		} as unknown as BeforeFirstTurnContext);
+		expect(prep?.messages).toBeUndefined();
+		expect(prep?.model?.id).toBe("deepseek/deepseek-v4-flash-0731");
+		expect(prep?.thinkingLevel).toBe("medium");
+		expect(calls).toEqual(["deepseek/deepseek-v4-flash-0731"]); // triage only, no planner
+		expect(routing.shouldCheckpoint({ toolTurnCount: 6 })).toBe(false);
+
+		replies["z-ai/glm-5.2"] = ["VERIFIED"];
+		const verified = await routing.verifyTurn({
+			kind: "final",
+			message: assistant("done"),
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [
+				{
+					role: "user",
+					content: "Bump the copyright year in the site footer to 2026 please.",
+					timestamp: Date.now(),
+				},
+				toolResult("bash", "edited footer"),
+			],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel,
+		} as unknown as VerifyTurnContext);
+		expect(verified?.status).toBe("verified");
+		expect(calls).toEqual(["deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.2"]); // glm, not kimi
+	});
+
+	it("unparseable or failing triage falls back to STANDARD", async () => {
+		const { routing, replies, runModel, auditLogPath } = setup({ triage: { enabled: true } });
+		replies["deepseek/deepseek-v4-flash-0731"] = ["dunno, somewhere in the middle"];
+		await routing.beforeFirstTurn({
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [
+				{ role: "user", content: "Add input validation to the settings loader with tests.", timestamp: Date.now() },
+			],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel,
+		} as unknown as BeforeFirstTurnContext);
+		expect(readAudit(auditLogPath).some((e) => e.event === "triage" && e.tier === "standard")).toBe(true);
+	});
+
+	it("planner CLARIFY makes the maker relay questions and stop instead of guessing", async () => {
+		const { routing, replies, runModel, auditLogPath } = setup();
+		replies["anthropic/claude-opus-5"] = [
+			"CLARIFY:\n1. Which auth method should sessions use?\n2. Is downtime acceptable?",
+		];
+		const prep = await routing.beforeFirstTurn({
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [
+				{
+					role: "user",
+					content: "Migrate authentication to the new provider sometime soon.",
+					timestamp: Date.now(),
+				},
+			],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel,
+		} as unknown as BeforeFirstTurnContext);
+		const injected = prep?.messages?.[0] && messageText(prep.messages[0] as any);
+		expect(injected).toContain("clarification");
+		expect(injected).toContain("Which auth method");
+		expect(injected).toContain("Do not run tools");
+		expect(injected).not.toContain("[PLANNER] Execute this plan");
+		expect(readAudit(auditLogPath).some((e) => e.event === "clarify")).toBe(true);
+	});
+
+	it("keeps the escalated maker after a verified checkpoint (sticky), demotes on final", async () => {
+		const { routing, replies, runModel } = setup({ planAfterRejections: 99 });
+		const base = (msgs: AgentMessage[]) =>
+			({
+				kind: "checkpoint",
+				toolTurnCount: 2,
+				message: assistant("progress"),
+				context: { systemPrompt: "", messages: [], tools: [] },
+				newMessages: msgs,
+				config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+				runModel,
+			}) as unknown as VerifyTurnContext;
+		const msgs: AgentMessage[] = [
+			{ role: "user", content: "Build add() with tests.", timestamp: Date.now() },
+			toolResult("bash", "wip"),
+		];
+
+		replies["z-ai/glm-5.2"] = ["No tests yet, drifting. CONFLICT"];
+		const rejected = await routing.verifyTurn(base(msgs));
+		expect(rejected?.status).toBe("rejected");
+		if (rejected?.status === "rejected") expect(rejected.model?.id).toBe("openai/gpt-5.6-luna");
+
+		replies["z-ai/glm-5.2"] = ["Back on track. VERIFIED"];
+		const verifiedCheckpoint = await routing.verifyTurn(base(msgs));
+		expect(verifiedCheckpoint?.status).toBe("verified");
+		if (verifiedCheckpoint?.status === "verified") {
+			expect(verifiedCheckpoint.model?.id).toBe("openai/gpt-5.6-luna"); // sticky, no ping-pong
+		}
+
+		replies["moonshotai/kimi-k3"] = ["All good. VERIFIED"];
+		const verifiedFinal = await routing.verifyTurn({
+			...(base(msgs) as object),
+			kind: "final",
+		} as unknown as VerifyTurnContext);
+		expect(verifiedFinal?.status).toBe("verified");
+		if (verifiedFinal?.status === "verified") {
+			expect(verifiedFinal.model?.id).toBe("deepseek/deepseek-v4-flash-0731"); // run over, demote
+		}
+	});
+
+	it("checker audits carry the excellence charter and log cost fields; final emits run-summary", async () => {
+		const { routing, replies, runModel, auditLogPath } = setup({ planFirst: false });
+		const seenPrompts: string[] = [];
+		const recordingRunModel = async (model: Model<any>, msgs: AgentMessage[]) => {
+			seenPrompts.push(msgs.map((m) => messageText(m as any)).join("\n"));
+			return runModel(model, msgs);
+		};
+		replies["moonshotai/kimi-k3"] = ["All good. VERIFIED"];
+		const verified = await routing.verifyTurn({
+			kind: "final",
+			message: assistant("done"),
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [
+				{ role: "user", content: "Build add() with tests.", timestamp: Date.now() },
+				toolResult("bash", "npm test ok"),
+			],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel: recordingRunModel,
+		} as unknown as VerifyTurnContext);
+		expect(verified?.status).toBe("verified");
+		expect(seenPrompts.join("\n")).toContain(EXCELLENCE_CHARTER.slice(0, 60));
+
+		const audit = readAudit(auditLogPath);
+		const auditEvent = audit.find((e) => e.event === "audit");
+		expect(auditEvent?.tokensIn).toBeDefined();
+		expect(auditEvent?.tokensOut).toBeDefined();
+		expect(auditEvent?.costUsd).toBeDefined();
+		const summary = audit.find((e) => e.event === "run-summary");
+		expect(summary?.outcome).toBe("verified");
+		expect(summary?.verifyCalls).toBeGreaterThan(0);
+	});
+
+	it("re-asks once on an ambiguous verdict before failing open", async () => {
+		const { routing, calls, replies, runModel } = setup({ planFirst: false });
+		replies["moonshotai/kimi-k3"] = ["hmm, mixed feelings", "Fine on second look. VERIFIED"];
+		const verified = await routing.verifyTurn({
+			kind: "final",
+			message: assistant("done"),
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [
+				{ role: "user", content: "Build add() with tests.", timestamp: Date.now() },
+				toolResult("bash", "npm test ok"),
+			],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel,
+		} as unknown as VerifyTurnContext);
+		expect(verified?.status).toBe("verified");
+		expect(calls).toEqual(["moonshotai/kimi-k3", "moonshotai/kimi-k3"]);
 	});
 
 	it("returns undefined when checker model cannot be resolved", () => {
