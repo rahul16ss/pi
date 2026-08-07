@@ -1609,6 +1609,33 @@ describe("verifyTurn maker/checker/failsafe loop", () => {
 		]);
 		expect(corrective).toEqual(["go", "Conflict: rework the answer with maximum rigor."]);
 	});
+
+	it("emits a user-visible notice before agent_end when work is accepted unverified", async () => {
+		const config: AgentLoopConfig = {
+			model: modelWithId("deepseek/deepseek-v4-flash-0731"),
+			convertToLlm: identityConverter,
+			verifyTurn: async () => ({
+				status: "verified",
+				notice: "[VERIFY] UNVERIFIED — final answer accepted on checker budget",
+			}),
+		};
+
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+		const stream = agentLoop([createUserMessage("go")], context, config, undefined, recordingStreamFn([]));
+		const userMessages: string[] = [];
+		let noticeSeenBeforeEnd = false;
+		for await (const event of stream) {
+			if (event.type === "message_start" && event.message.role === "user") {
+				userMessages.push(typeof event.message.content === "string" ? event.message.content : "");
+			}
+			if (event.type === "agent_end") {
+				noticeSeenBeforeEnd = userMessages.some((m) => m.includes("[VERIFY] UNVERIFIED"));
+			}
+		}
+		const messages = await stream.result();
+		expect(noticeSeenBeforeEnd).toBe(true);
+		expect(messages.some((m) => m.role === "user" && String(m.content).includes("[VERIFY] UNVERIFIED"))).toBe(true);
+	});
 });
 
 describe("mid-build plan/checkpoint routing in agent loop", () => {

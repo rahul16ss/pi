@@ -71,6 +71,17 @@ describe("classifyCheckerVerdict", () => {
 		expect(classifyCheckerVerdict("")).toBe("ambiguous");
 		expect(classifyCheckerVerdict("maybe ok")).toBe("ambiguous");
 	});
+
+	it("never reads a negated or hedged VERIFIED as a pass", () => {
+		expect(classifyCheckerVerdict("This cannot be VERIFIED")).toBe("ambiguous");
+		expect(classifyCheckerVerdict("The claims are not VERIFIED yet")).toBe("ambiguous");
+		expect(classifyCheckerVerdict("I can't say VERIFIED without receipts")).toBe("ambiguous");
+		expect(classifyCheckerVerdict("un-verified claims here")).toBe("ambiguous");
+		// Lowercase prose is not the exact verdict token.
+		expect(classifyCheckerVerdict("I verified the tests myself")).toBe("ambiguous");
+		// A pass after an unrelated negation in an earlier sentence still counts.
+		expect(classifyCheckerVerdict("No issues found.\nVERIFIED")).toBe("verified");
+	});
 });
 
 describe("shouldEscalateMaker", () => {
@@ -244,9 +255,29 @@ describe("createVerifyRouting", () => {
 		expect(prep?.messages?.[0] && messageText(prep.messages[0] as any)).toContain("[PLANNER]");
 		expect(prep?.model?.id).toBe("deepseek/deepseek-v4-flash-0731");
 
+		// A second user prompt is a new run: state resets and the planner runs again.
 		const second = await routing.beforeFirstTurn(ctx);
-		expect(second).toBeUndefined();
-		expect(readAudit(auditLogPath).some((e) => e.event === "planned")).toBe(true);
+		expect(second?.messages?.length).toBeGreaterThan(0);
+		expect(calls).toEqual(["anthropic/claude-opus-5", "anthropic/claude-opus-5"]);
+		const audit = readAudit(auditLogPath);
+		expect(audit.filter((e) => e.event === "planned").length).toBe(2);
+		expect(audit.filter((e) => e.event === "run-start").length).toBe(2);
+	});
+
+	it("does not reset or plan on continues that carry no new user message", async () => {
+		const { routing, calls, runModel } = setup();
+		const prep = await routing.beforeFirstTurn({
+			context: {
+				systemPrompt: "",
+				messages: [{ role: "user", content: "Implement a robust add() helper with tests.", timestamp: Date.now() }],
+				tools: [],
+			},
+			newMessages: [],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel,
+		} as unknown as BeforeFirstTurnContext);
+		expect(prep).toBeUndefined();
+		expect(calls).toEqual([]);
 	});
 
 	it("skips planFirst for short conversational prompts", async () => {
@@ -427,8 +458,11 @@ describe("createVerifyRouting", () => {
 		expect(accepted?.status).toBe("verified");
 		if (accepted?.status === "verified") {
 			expect(accepted.model?.id).toBe("deepseek/deepseek-v4-flash-0731");
+			expect(accepted.notice).toContain("[VERIFY] UNVERIFIED");
+			expect(accepted.notice).toContain("still bad");
 		}
-		expect(readAudit(auditLogPath).some((e) => e.event === "budget-exhausted")).toBe(true);
+		const exhausted = readAudit(auditLogPath).find((e) => e.event === "budget-exhausted");
+		expect(exhausted?.accepted).toBe("unverified");
 	});
 
 	it("returns undefined when checker model cannot be resolved", () => {

@@ -86,14 +86,18 @@ export function shouldPlanFirst(opts: {
 
 /**
  * Classify a checker reply.
- * Prefer CONFLICT when present. Never treat the substring inside "unverified" as VERIFIED.
+ * Prefer CONFLICT when present. Never treat the substring inside "unverified"
+ * as VERIFIED, and never treat a negated VERIFIED ("cannot be VERIFIED") as a
+ * pass. The positive match is case-sensitive: the audit prompt demands the
+ * exact uppercase token, so prose like "I verified the tests" stays ambiguous.
  */
 export function classifyCheckerVerdict(auditText: string): "verified" | "conflict" | "ambiguous" {
 	const text = auditText.trim();
 	if (!text) return "ambiguous";
 	if (/\bCONFLICT\b/i.test(text)) return "conflict";
-	if (/\bunverified\b/i.test(text)) return "ambiguous";
-	if (/\bVERIFIED\b/i.test(text)) return "verified";
+	if (/\bun-?verified\b/i.test(text)) return "ambiguous";
+	if (/\b(?:not|cannot|can't|isn't|is not|never|won't|no)\b[^.\n]{0,60}?\bVERIFIED\b/i.test(text)) return "ambiguous";
+	if (/\bVERIFIED\b/.test(text)) return "verified";
 	return "ambiguous";
 }
 
@@ -148,6 +152,17 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 	let checkpointsSoFar = 0;
 	let alreadyPlanned = false;
 	let makerEscalated = false;
+
+	// A run is one user prompt. Without this reset, `alreadyPlanned` and the
+	// checkpoint budget leak across tasks and every task after the first runs
+	// with no plan and no mid-build audits.
+	const resetRunState = (): void => {
+		finalRejections = 0;
+		checkpointRejections = 0;
+		checkpointsSoFar = 0;
+		alreadyPlanned = false;
+		makerEscalated = false;
+	};
 
 	const demoteMaker = (): { model: Model<any>; thinkingLevel: ThinkingLevel } => {
 		makerEscalated = false;
@@ -338,12 +353,16 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 
 	return {
 		beforeFirstTurn: async (ctx) => {
+			// Only a fresh user prompt starts a new run. Continues/retries carry no
+			// new user message and must not reset state or re-plan mid-task.
+			const firstUser = ctx.newMessages.find((m) => m.role === "user");
+			if (!firstUser) return undefined;
+			const promptText = messageText(firstUser as UserMessage);
+			resetRunState();
+			logVerify({ event: "run-start", chars: promptText.length });
+
 			const planner = resolveModel(verify.plannerModel);
 			if (!planner) return undefined;
-
-			const firstUser =
-				ctx.newMessages.find((m) => m.role === "user") ?? ctx.context.messages.find((m) => m.role === "user");
-			const promptText = firstUser ? messageText(firstUser as UserMessage) : "";
 			if (!shouldPlanFirst({ planFirst, promptText, minPromptChars, alreadyPlanned })) {
 				logVerify({
 					event: "plan-skipped",
@@ -445,22 +464,42 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 			if (kind === "checkpoint") {
 				checkpointRejections++;
 				if (checkpointRejections > maxRejections) {
-					logVerify({ event: "budget-exhausted", kind, rejections: checkpointRejections });
+					logVerify({
+						event: "budget-exhausted",
+						kind,
+						rejections: checkpointRejections,
+						accepted: "unverified",
+					});
 					checkpointRejections = 0;
 					const base = demoteMaker();
-					// Accept progress and keep building on the base maker.
-					return { status: "verified", model: base.model, thinkingLevel: base.thinkingLevel };
+					// Accept progress and keep building, but say so honestly.
+					return {
+						status: "verified",
+						model: base.model,
+						thinkingLevel: base.thinkingLevel,
+						notice:
+							"[VERIFY] UNVERIFIED — mid-build progress accepted on checker budget " +
+							`(${maxRejections} rejections). Last checker feedback: ${auditText.slice(0, 400)}`,
+					};
 				}
 				return rejectWithOptionalPlan(vctx, kind, auditText, checkpointRejections);
 			}
 
 			finalRejections++;
 			if (finalRejections > maxRejections) {
-				logVerify({ event: "budget-exhausted", kind, rejections: finalRejections });
+				logVerify({ event: "budget-exhausted", kind, rejections: finalRejections, accepted: "unverified" });
 				finalRejections = 0;
 				const base = demoteMaker();
-				// Accept the final answer as-is and stop (verified ends the loop).
-				return { status: "verified", model: base.model, thinkingLevel: base.thinkingLevel };
+				// Accept the final answer and stop (verified ends the loop), but the
+				// user must see that the checker never signed off.
+				return {
+					status: "verified",
+					model: base.model,
+					thinkingLevel: base.thinkingLevel,
+					notice:
+						"[VERIFY] UNVERIFIED — final answer accepted on checker budget " +
+						`(${maxRejections} rejections). Treat with suspicion. Last checker feedback: ${auditText.slice(0, 400)}`,
+				};
 			}
 			return rejectWithOptionalPlan(vctx, kind, auditText, finalRejections);
 		},

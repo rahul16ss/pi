@@ -312,6 +312,17 @@ async function runLoop(
 							reasoning: verifyResult.thinkingLevel === "off" ? undefined : verifyResult.thinkingLevel,
 						};
 					}
+					if (verifyResult.notice) {
+						const noticeMessage: AgentMessage = {
+							role: "user",
+							content: verifyResult.notice,
+							timestamp: Date.now(),
+						};
+						await emit({ type: "message_start", message: noticeMessage });
+						await emit({ type: "message_end", message: noticeMessage });
+						currentContext.messages.push(noticeMessage);
+						newMessages.push(noticeMessage);
+					}
 					// Final verified → stop. Checkpoint verified → keep building (possibly demoted).
 					if (verifyKind === "final") {
 						await emit({ type: "agent_end", messages: newMessages });

@@ -202,6 +202,12 @@ export type TurnVerifyResult =
 			model?: Model<any>;
 			/** Optional thinking level to apply with `model`. */
 			thinkingLevel?: ThinkingLevel;
+			/**
+			 * Optional user-visible notice injected into the transcript before the
+			 * loop proceeds. Used for honest budget-exhaustion: the answer is
+			 * accepted, but the user must see it was never verified.
+			 */
+			notice?: string;
 	  }
 	| {
 			status: "rejected";
