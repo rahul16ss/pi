@@ -618,8 +618,11 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 		(signals ? `\n\nRepo signals:\n${signals}` : "");
 
 	const clarifyDirective = (questions: string): string =>
-		"[PLANNER] The goal needs clarification before any work starts. Relay the following questions to the user " +
-		"verbatim, then STOP and wait for their answers. Do not run tools, do not write code, do not guess:\n\n" +
+		"[PLANNER] Open questions block this goal. FIRST investigate the repository and environment yourself with " +
+		"read-only tools and answer every question you can from evidence — never ask the user anything you can " +
+		"discover. THEN ask the user only what remains and is genuinely theirs to answer (intent, scope trade-offs, " +
+		"budgets, external access): at most 5 questions, one sentence each. Then STOP and wait for their answers — " +
+		"do not write code and do not guess on the questions you relay.\n\nPlanner's open questions:\n\n" +
 		questions;
 
 	return {
@@ -692,11 +695,20 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 							content:
 								`Goal:\n${promptText}\n\n` +
 								(signals ? `Repo signals:\n${signals}\n\n` : "") +
-								"You are a senior planner. If the goal is ambiguous, underspecified, or has multiple " +
-								"defensible interpretations, do NOT plan: reply with the word CLARIFY on the first line, " +
-								"followed by numbered questions for the user. Otherwise do NOT implement or claim the work " +
-								"is done. Produce a short, concrete, step-by-step plan a maker model can execute. Include " +
-								"how to verify (tests/build/lint) at the end.",
+								"You are a senior planner with no tool access, but the maker executing your plan has FULL " +
+								"tool access: it can read any file, search the repo, and run commands. PLAN BY DEFAULT.\n" +
+								"Never ask the user anything discoverable from the repository or by running commands — make " +
+								"investigating those facts the first steps of the plan instead. Audits, reviews, and " +
+								"'figure out what to improve' goals are self-contained: discovery IS the work, so never " +
+								"CLARIFY for them. Where the goal leaves room, state explicit assumptions in the plan and " +
+								"proceed rather than asking.\n" +
+								"Reply CLARIFY only when a decision is genuinely the user's to make (product intent, scope " +
+								"trade-offs, spend approvals, external accounts/credentials) AND guessing wrong would waste " +
+								"most of the work: first line CLARIFY, then AT MOST 5 numbered questions, one sentence each " +
+								"with a short why-it-matters, no preamble.\n" +
+								"Otherwise produce a short, concrete, step-by-step plan the maker can execute — " +
+								"investigation steps first, assumptions stated explicitly, and how to verify " +
+								"(tests/build/lint) at the end. Do NOT implement or claim the work is done.",
 							timestamp: Date.now(),
 						},
 					],
@@ -709,7 +721,8 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 					return baseResult;
 				}
 				if (/^\s*CLARIFY\b/i.test(planText)) {
-					const questions = planText.replace(/^\s*CLARIFY\W*/i, "").trim() || planText;
+					// Backstop: even a misbehaving planner cannot relay a wall of text.
+					const questions = (planText.replace(/^\s*CLARIFY\W*/i, "").trim() || planText).slice(0, 2_000);
 					logVerify({ event: "clarify", planner: planner.id, tier, text: questions.slice(0, 240), ...cost });
 					return {
 						...baseResult,

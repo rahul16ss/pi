@@ -601,11 +601,44 @@ describe("createVerifyRouting", () => {
 			runModel,
 		} as unknown as BeforeFirstTurnContext);
 		const injected = prep?.messages?.[0] && messageText(prep.messages[0] as any);
-		expect(injected).toContain("clarification");
+		expect(injected).toContain("FIRST investigate");
+		expect(injected).toContain("never ask the user anything you can discover");
+		expect(injected).toContain("at most 5 questions");
 		expect(injected).toContain("Which auth method");
-		expect(injected).toContain("Do not run tools");
 		expect(injected).not.toContain("[PLANNER] Execute this plan");
 		expect(readAudit(auditLogPath).some((e) => e.event === "clarify")).toBe(true);
+	});
+
+	it("caps a runaway CLARIFY question dump and biases the planner prompt toward planning", async () => {
+		const { routing, replies, runModel } = setup();
+		const wall = `CLARIFY:\n${Array.from({ length: 40 }, (_, i) => `${i + 1}. Question ${i + 1}?`).join("\n")}${"x".repeat(5_000)}`;
+		replies["anthropic/claude-opus-5"] = [wall];
+		const seenPrompts: string[] = [];
+		const recordingRunModel = async (model: Model<any>, msgs: AgentMessage[]) => {
+			seenPrompts.push(msgs.map((m) => messageText(m as any)).join("\n"));
+			return runModel(model, msgs);
+		};
+		const prep = await routing.beforeFirstTurn({
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [
+				{
+					role: "user",
+					content: "Audit this project end to end and improve whatever needs improving.",
+					timestamp: Date.now(),
+				},
+			],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel: recordingRunModel,
+		} as unknown as BeforeFirstTurnContext);
+		const injected = (prep?.messages?.[0] && messageText(prep.messages[0] as any)) ?? "";
+		// Relayed questions are hard-capped even when the planner misbehaves.
+		expect(injected.length).toBeLessThan(2_600);
+		// The planner instruction itself demands plan-by-default and forbids discoverable questions.
+		const plannerPrompt = seenPrompts.join("\n");
+		expect(plannerPrompt).toContain("PLAN BY DEFAULT");
+		expect(plannerPrompt).toContain("Never ask the user anything discoverable");
+		expect(plannerPrompt).toContain("never CLARIFY for them");
+		expect(plannerPrompt).toContain("AT MOST 5 numbered questions");
 	});
 
 	it("keeps the escalated maker after a verified checkpoint (sticky), demotes on final", async () => {
