@@ -20,6 +20,7 @@ import type {
 	OpenAIResponsesCompat,
 } from "../src/types.ts";
 import {
+	assertExactModelIds,
 	createModelDataManifest,
 	type ModelDataStructure,
 	MODEL_DATA_MANIFEST_FILE,
@@ -295,6 +296,23 @@ const QWEN_TOKEN_PLAN_REASONING_EFFORT_UNSUPPORTED_MODEL_IDS = new Set([
 ]);
 // Retired preview id — models.dev may still list it after GA ships.
 const QWEN_TOKEN_PLAN_EXCLUDED_MODEL_IDS = new Set(["qwen3.8-max-preview"]);
+const QWEN_TOKEN_PLAN_PROVIDER_IDS = new Set<string>([
+	"qwen-token-plan",
+	"qwen-token-plan-cn",
+	"qwen-token-plan-individual",
+]);
+// QwenCloud Token Plan Individual text-model allowlist, verified 2026-08-05.
+// Retired models remain excluded above even if the public catalog lags.
+// https://docs.qwencloud.com/token-plan/personal/token-plan-personal-overview
+const QWEN_TOKEN_PLAN_INDIVIDUAL_MODEL_IDS = new Set<string>([
+	"deepseek-v4-flash-0731",
+	"deepseek-v4-pro",
+	"glm-5.2",
+	"qwen3.6-flash",
+	"qwen3.7-max",
+	"qwen3.7-plus",
+	"qwen3.8-max",
+]);
 
 const KIMI_K3_MAX_TOKENS = 131072;
 const KIMI_K3_COST = {
@@ -333,6 +351,12 @@ const OPENAI_TOOL_SEARCH_MODEL_IDS = new Set([
 	"gpt-5.6-terra",
 	"gpt-5.6-luna",
 ]);
+// Public OpenAI documents additional_tools for applications that load tools
+// outside the normal tool-search flow. Codex currently uses the input item for
+// its Responses Lite GPT-5.6 models.
+// https://developers.openai.com/api/docs/guides/tools-tool-search#add-tools-at-a-specific-point-in-the-input
+const OPENAI_ADDITIONAL_TOOLS_MODEL_IDS = OPENAI_TOOL_SEARCH_MODEL_IDS;
+const OPENAI_CODEX_ADDITIONAL_TOOLS_MODEL_IDS = new Set(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
 const OPENAI_LONG_CONTEXT_INPUT_THRESHOLD = 272000;
 const OPENAI_SHORT_CONTEXT_CAPPED_MODEL_IDS = new Set([
 	"gpt-5.4",
@@ -619,11 +643,18 @@ function detectOpenAICompletionsCompat(model: Model<"openai-completions">): Open
 		isCloudflareAiGateway ||
 		isAntLing;
 
+	const isDeepSeek = provider === "deepseek" || baseUrl.includes("deepseek.com");
 	const useMaxTokens =
-		baseUrl.includes("chutes.ai") || isMoonshot || isCloudflareAiGateway || isTogether || isNvidia || isAntLing || isZai;
+		baseUrl.includes("chutes.ai") ||
+		isDeepSeek ||
+		isMoonshot ||
+		isCloudflareAiGateway ||
+		isTogether ||
+		isNvidia ||
+		isAntLing ||
+		isZai;
 
 	const isGrok = provider === "xai" || baseUrl.includes("api.x.ai");
-	const isDeepSeek = provider === "deepseek" || baseUrl.includes("deepseek.com");
 	const isOpenRouterDeveloperRoleModel =
 		isOpenRouter && (model.id.startsWith("anthropic/") || model.id.startsWith("openai/"));
 	const cacheControlFormat =
@@ -737,8 +768,12 @@ function applyOpenAIToolSearchMetadata(model: Model<Api>): void {
 	const isOpenAIResponses = model.provider === "openai" && model.api === "openai-responses";
 	const isOpenAICodex = model.provider === "openai-codex" && model.api === "openai-codex-responses";
 	if (!(isOpenAIResponses || isOpenAICodex) || !OPENAI_TOOL_SEARCH_MODEL_IDS.has(model.id)) return;
+	const supportsAdditionalTools =
+		(isOpenAIResponses && OPENAI_ADDITIONAL_TOOLS_MODEL_IDS.has(model.id)) ||
+		(isOpenAICodex && OPENAI_CODEX_ADDITIONAL_TOOLS_MODEL_IDS.has(model.id));
 	model.compat = {
 		...(model.compat as OpenAIResponsesCompat | undefined),
+		...(supportsAdditionalTools ? { supportsAdditionalTools: true } : {}),
 		supportsToolSearch: true,
 	};
 }
@@ -2146,10 +2181,11 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 			}
 		}
 
-		// Process Alibaba Cloud Model Studio Token Plan models
-		// Two regions (international / cn) with identical catalogs, separate
-		// endpoints and API keys (sk-sp- prefix). models.dev keys are
-		// "alibaba-token-plan[-cn]"; pi exposes them as "qwen-token-plan[-cn]".
+		// Process Alibaba Cloud Model Studio Token Plan models. International and
+		// China use separate endpoints and API keys (sk-sp- prefix). The Individual
+		// provider reuses the international source and endpoint with a narrower catalog.
+		// models.dev keys are "alibaba-token-plan[-cn]"; pi exposes them as
+		// "qwen-token-plan[-cn]" plus the Individual catalog view.
 		const qwenTokenPlanCompat: OpenAICompletionsCompat = {
 			thinkingFormat: "qwen",
 			supportsDeveloperRole: false,
@@ -2161,22 +2197,31 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 				source: "alibaba-token-plan",
 				provider: "qwen-token-plan",
 				baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+				modelIds: undefined,
+			},
+			{
+				source: "alibaba-token-plan",
+				provider: "qwen-token-plan-individual",
+				baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+				modelIds: QWEN_TOKEN_PLAN_INDIVIDUAL_MODEL_IDS,
 			},
 			{
 				source: "alibaba-token-plan-cn",
 				provider: "qwen-token-plan-cn",
 				baseUrl: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+				modelIds: undefined,
 			},
 		] as const;
 
-		for (const { source, provider, baseUrl } of qwenTokenPlanVariants) {
+		for (const { source, provider, baseUrl, modelIds } of qwenTokenPlanVariants) {
 			const providerModels = data[source]?.models;
-			if (!providerModels) continue;
+			const emittedModelIds = modelIds ? new Set<string>() : undefined;
 
-			for (const [modelId, model] of Object.entries(providerModels)) {
+			for (const [modelId, model] of Object.entries(providerModels ?? {})) {
 				const m = model as ModelsDevModel;
 				if (m.tool_call !== true) continue;
 				if (QWEN_TOKEN_PLAN_EXCLUDED_MODEL_IDS.has(modelId)) continue;
+				if (modelIds && !modelIds.has(modelId)) continue;
 				const supportsReasoningEffort = !QWEN_TOKEN_PLAN_REASONING_EFFORT_UNSUPPORTED_MODEL_IDS.has(modelId);
 
 				models.push({
@@ -2207,7 +2252,12 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 				});
+				emittedModelIds?.add(modelId);
 				recordModelsDevReasoningOptions(provider, modelId, m);
+			}
+
+			if (modelIds && emittedModelIds && generatorOptions.strict) {
+				assertExactModelIds(provider, modelIds, emittedModelIds);
 			}
 		}
 
@@ -2312,7 +2362,6 @@ async function generateModels() {
 			candidate.cost.cacheRead = 0.119;
 		}
 	}
-
 
 	// Add missing gpt models
 	const missingOpenAiModels: Model<"openai-responses">[] = [
@@ -2474,8 +2523,7 @@ async function generateModels() {
 		if (
 			candidate.api === "openai-completions" &&
 			candidate.id.includes("deepseek-v4") &&
-			candidate.provider !== "qwen-token-plan" &&
-			candidate.provider !== "qwen-token-plan-cn"
+			!QWEN_TOKEN_PLAN_PROVIDER_IDS.has(candidate.provider)
 		) {
 			const preservesNativeReasoningEffort = candidate.provider === "openrouter" || candidate.provider === "opencode";
 			candidate.compat = {
