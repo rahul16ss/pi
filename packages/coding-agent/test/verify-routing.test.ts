@@ -99,12 +99,28 @@ describe("classifyTriageTier", () => {
 });
 
 describe("isConversationalPrompt", () => {
-	it("catches greetings and very short prompts, not real short tasks", () => {
+	it("catches greetings and acknowledgments, not real tasks", () => {
 		expect(isConversationalPrompt("hi")).toBe(true);
 		expect(isConversationalPrompt("thanks, looks great!")).toBe(true);
 		expect(isConversationalPrompt("ok")).toBe(true);
+		expect(isConversationalPrompt("got it")).toBe(true);
 		expect(isConversationalPrompt("fix the race condition in session resume")).toBe(false);
 		expect(isConversationalPrompt("refactor the settings loader to be async")).toBe(false);
+	});
+
+	it("does not treat a short real task as conversational", () => {
+		expect(isConversationalPrompt("fix the typo")).toBe(false);
+		expect(isConversationalPrompt("bump the version")).toBe(false);
+		expect(isConversationalPrompt("explain why X")).toBe(false);
+		expect(isConversationalPrompt("is this safe?")).toBe(false);
+		expect(isConversationalPrompt("review this")).toBe(false);
+	});
+
+	it("still treats short acknowledgments as conversational", () => {
+		expect(isConversationalPrompt("ok")).toBe(true);
+		expect(isConversationalPrompt("yes")).toBe(true);
+		expect(isConversationalPrompt("done")).toBe(true);
+		expect(isConversationalPrompt("sounds good")).toBe(true);
 	});
 });
 
@@ -405,8 +421,15 @@ describe("createVerifyRouting", () => {
 		expect(calls).toEqual(["moonshotai/kimi-k3"]);
 	});
 
-	it("skips final audit when auditOnlyAfterTools and no tool results", async () => {
+	it("skips final audit for trivial tier when auditOnlyAfterTools and no tool results", async () => {
 		const { routing, calls, runModel, auditLogPath } = setup();
+		// Route the run into the trivial tier via the conversational heuristic.
+		await routing.beforeFirstTurn({
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [{ role: "user", content: "ok", timestamp: Date.now() }],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel,
+		} as unknown as BeforeFirstTurnContext);
 		const result = await routing.verifyTurn({
 			kind: "final",
 			message: assistant("hello"),
@@ -418,6 +441,21 @@ describe("createVerifyRouting", () => {
 		expect(result).toBeUndefined();
 		expect(calls).toEqual([]);
 		expect(readAudit(auditLogPath).some((e) => e.reason === "no-tools")).toBe(true);
+	});
+
+	it("standard tier audits a no-tool final answer even with auditOnlyAfterTools", async () => {
+		const { routing, calls, replies, runModel } = setup();
+		replies["moonshotai/kimi-k3"] = ["All good. VERIFIED"];
+		const verified = await routing.verifyTurn({
+			kind: "final",
+			message: assistant("here is the explanation you asked for"),
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [{ role: "user", content: "explain why this design is safe", timestamp: Date.now() }],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel,
+		} as unknown as VerifyTurnContext);
+		expect(verified?.status).toBe("verified");
+		expect(calls).toEqual(["moonshotai/kimi-k3"]);
 	});
 
 	it("on final reject: escalates maker to luna, and on 2nd reject also plans with opus", async () => {

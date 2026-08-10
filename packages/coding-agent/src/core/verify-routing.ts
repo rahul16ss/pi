@@ -153,12 +153,31 @@ export function classifyTriageTier(reply: string): VerifyTier | undefined {
 	return match[1].toLowerCase() as VerifyTier;
 }
 
-/** Pure: conversational prompts that never need triage, planning, or audits. */
+/** Pure: conversational prompts that never need triage, planning, or audits.
+ *
+ * Conservative by design: a misclassification toward "not conversational" only
+ * costs one cheap triage call, while a misclassification toward "conversational"
+ * silently skips all verification. So the heuristic requires the prompt to be
+ * *entirely* a greeting/acknowledgment (the greeting word plus at most a short
+ * tail of filler). "fix the typo in README" is short but does not match the
+ * greeting pattern, so it goes through triage instead of skipping checks.
+ * Pure-reasoning requests ("explain X", "is Y safe?") are not conversational —
+ * they are exactly the answers that benefit from a checker.
+ */
 export function isConversationalPrompt(promptText: string): boolean {
 	const text = promptText.trim();
-	if (text.length < 20) return true;
+	if (text.length < 20) {
+		// Short prompt: conversational only if it is entirely a greeting or
+		// acknowledgment. Any other short prompt (including a real short task
+		// like "fix the typo") falls through to triage.
+		return GREETING_ONLY.test(text);
+	}
+	// Longer prompt: conversational only if it is entirely a greeting + short filler.
 	return /^(hi|hey|hello|thanks|thank you|ok|okay|yes|no|nice|cool|great|good)\b[\s\S]{0,40}$/i.test(text);
 }
+
+const GREETING_ONLY =
+	/^(hi|hey|hello|thanks|thank you|ok|okay|yes|no|nope|yep|sure|nice|cool|great|good|bye|sup|yo|alright|sounds good|got it|understood|acknowledged|will do|on it|done|agreed|right|correct|exactly)\b[\s!.,~]*$/i;
 
 function tierOverrides(verify: VerifySettings, tier: VerifyTier): VerifyTierOverrides | undefined {
 	if (tier === "trivial") return verify.tiers?.trivial;
@@ -866,7 +885,18 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 		verifyTurn: async (vctx) => {
 			const kind: VerifyKind = vctx.kind ?? "final";
 
-			if (kind === "final" && verify.auditOnlyAfterTools && !vctx.newMessages.some((m) => m.role === "toolResult")) {
+			// `auditOnlyAfterTools` skips the final audit when the maker used no
+			// tools. That is correct for the trivial tier (no artifact to audit),
+			// but for standard/hard a no-tool final answer is exactly where a
+			// second opinion matters most — explanations, design reviews, and
+			// reasoning have no diff to check, so the checker is the only back
+			// pressure. Gate the skip on the trivial tier only.
+			if (
+				kind === "final" &&
+				verify.auditOnlyAfterTools &&
+				tier === "trivial" &&
+				!vctx.newMessages.some((m) => m.role === "toolResult")
+			) {
 				logVerify({ event: "skipped", reason: "no-tools", kind, tier });
 				return undefined;
 			}
