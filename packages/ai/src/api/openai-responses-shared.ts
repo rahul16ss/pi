@@ -13,17 +13,6 @@ import type {
 	ResponseStreamEvent,
 	ResponseToolSearchOutputItemParam,
 } from "openai/resources/responses/responses.js";
-
-// The pinned OpenAI SDK (6.40.0) predates the `additional_tools` input item
-// that `deferredToolsMode: "additional-tools"` emits below. Define the shape
-// this code pushes so the `satisfies` holds; the cast to `ResponseInputItem`
-// bridges the gap until the SDK ships the type.
-interface AdditionalToolsInputItem {
-	type: "additional_tools";
-	role: "developer";
-	tools: OpenAITool[];
-}
-
 import { calculateCost } from "../models.ts";
 import type {
 	Api,
@@ -47,10 +36,21 @@ import {
 	appendGrammarToolInputJsonDelta,
 	type GrammarToolInputJsonBuffer,
 	getGrammarToolInput,
+	getJsonSchemaToolParameters,
 	resolveGrammarConstrainedSampling,
 	resolveJsonSchemaStrictSampling,
 } from "./constrained-sampling.ts";
 import { transformMessages } from "./transform-messages.ts";
+
+// The pinned OpenAI SDK (6.40.0) predates the `additional_tools` input item
+// that `deferredToolsMode: "additional-tools"` emits below. Define the shape
+// this code pushes so the `satisfies` holds; the cast to `ResponseInputItem`
+// bridges the gap until the SDK ships the type.
+interface AdditionalToolsInputItem {
+	type: "additional_tools";
+	role: "developer";
+	tools: OpenAITool[];
+}
 
 // =============================================================================
 // Utilities
@@ -388,17 +388,18 @@ export function convertResponsesTools(tools: readonly Tool[], options?: ConvertR
 		}
 
 		const constrainedStrict = resolveJsonSchemaStrictSampling(tool, supportsStrictMode);
+		const strict = constrainedStrict ?? defaultStrict;
 		const functionTool: Omit<Extract<OpenAITool, { type: "function" }>, "strict"> & {
 			strict?: Extract<OpenAITool, { type: "function" }>["strict"];
 		} = {
 			type: "function",
 			name: tool.name,
 			description: tool.description,
-			parameters: tool.parameters as Record<string, unknown>, // TypeBox already generates JSON Schema
+			parameters: getJsonSchemaToolParameters(tool, strict === true) as Record<string, unknown>,
 			...(options?.deferLoading ? { defer_loading: true } : {}),
 		};
 		if (supportsStrictMode) {
-			functionTool.strict = constrainedStrict ?? defaultStrict;
+			functionTool.strict = strict;
 		}
 		return functionTool as OpenAITool;
 	});
