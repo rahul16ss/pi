@@ -18,6 +18,9 @@ export default mergeConfig(
 				deps: {
 					external: [/@silvia-odwyer\/photon-node/],
 				},
+				fs: {
+					allow: [fileURLToPath(new URL("../../../.pi/agent/extensions", import.meta.url))],
+				},
 			},
 		},
 		resolve: {

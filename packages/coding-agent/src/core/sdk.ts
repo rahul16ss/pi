@@ -352,6 +352,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		routing
 			? {
 					event: "installed",
+					schema: 2,
 					checker: verifyConfig?.checkerModel,
 					checkpointChecker: verifyConfig?.checkpointCheckerModel ?? verifyConfig?.checkerModel,
 					planner: verifyConfig?.plannerModel,
@@ -359,9 +360,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					planFirst: verifyConfig?.planFirst ?? Boolean(verifyConfig?.plannerModel),
 					checkpointEveryToolTurns: verifyConfig?.checkpointEveryToolTurns ?? 0,
 					escalateAfterRejections: verifyConfig?.escalateAfterRejections ?? 1,
+					maxMakerTurns: verifyConfig?.maxMakerTurns ?? 0,
+					maxToolCallsPerRun: verifyConfig?.maxToolCallsPerRun ?? 0,
+					maxRunMs: verifyConfig?.maxRunMs ?? 0,
+					maxRunCostUsd: verifyConfig?.maxRunCostUsd ?? 0,
+					unavailablePolicy: verifyConfig?.unavailablePolicy ?? "surface-unverified",
 				}
 			: {
 					event: "disabled",
+					schema: 2,
 					reason: verifyConfig?.checkerModel ? "checker-unresolvable" : "no-checker-configured",
 				},
 	);
@@ -481,6 +488,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		followUpMode: settingsManager.getFollowUpMode(),
 		beforeFirstTurn: wrappedBeforeFirstTurn,
 		shouldCheckpoint: routing ? (ctx) => routing.shouldCheckpoint(ctx) : undefined,
+		shouldStopAfterTurn: routing ? (ctx) => routing.shouldStopAfterTurn(ctx) : undefined,
 		verifyTurn: wrappedVerifyTurn,
 		onTurnError: wrappedOnTurnError,
 		transport: settingsManager.getTransport(),

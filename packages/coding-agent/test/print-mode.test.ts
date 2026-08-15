@@ -1,7 +1,7 @@
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SessionShutdownEvent } from "../src/index.ts";
-import { runPrintMode } from "../src/modes/print-mode.ts";
+import { formatPrintProgress, runPrintMode } from "../src/modes/print-mode.ts";
 
 type EmitEvent = SessionShutdownEvent;
 
@@ -138,5 +138,81 @@ describe("runPrintMode", () => {
 		expect(errorSpy).toHaveBeenCalledWith("provider failure");
 		expect(session.extensionRunner.emit).toHaveBeenCalledTimes(1);
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
+	});
+});
+
+describe("formatPrintProgress", () => {
+	it("reports turns and tool names without dumping payloads", () => {
+		expect(formatPrintProgress({ type: "turn_start" })).toMatch(/working/);
+		expect(
+			formatPrintProgress({ type: "tool_execution_start", toolName: "read", args: { path: "foo.ts" } }),
+		).toContain("read foo.ts");
+		expect(
+			formatPrintProgress({
+				type: "tool_execution_start",
+				toolName: "write",
+				args: { path: "foo.ts", content: "SECRET_PAYLOAD" },
+			}),
+		).not.toContain("SECRET_PAYLOAD");
+		expect(formatPrintProgress({ type: "message_end" })).toBeUndefined();
+	});
+});
+
+describe("runPrintMode progress", () => {
+	it("writes brief progress to stderr in text mode", async () => {
+		const writes: string[] = [];
+		vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+			writes.push(String(chunk));
+			return true;
+		}) as typeof process.stderr.write);
+
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "done" }));
+		let listener: ((event: { type: string; toolName?: string; args?: unknown }) => void) | undefined;
+		runtimeHost.session.subscribe = vi.fn((fn) => {
+			listener = fn as typeof listener;
+			return () => {
+				listener = undefined;
+			};
+		});
+		runtimeHost.session.prompt = vi.fn(async () => {
+			listener?.({ type: "turn_start" });
+			listener?.({ type: "tool_execution_start", toolName: "read", args: { path: "foo.ts" } });
+		});
+
+		await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+			initialMessage: "go",
+		});
+
+		const out = writes.join("");
+		expect(out).toMatch(/working/);
+		expect(out).toContain("read foo.ts");
+	});
+
+	it("does not write text progress to stderr in json mode", async () => {
+		const writes: string[] = [];
+		vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+			writes.push(String(chunk));
+			return true;
+		}) as typeof process.stderr.write);
+
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "done" }));
+		let listener: ((event: { type: string; toolName?: string; args?: unknown }) => void) | undefined;
+		runtimeHost.session.subscribe = vi.fn((fn) => {
+			listener = fn as typeof listener;
+			return () => {
+				listener = undefined;
+			};
+		});
+		runtimeHost.session.prompt = vi.fn(async () => {
+			listener?.({ type: "turn_start" });
+		});
+
+		await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "json",
+			messages: ["hello"],
+		});
+
+		expect(writes.join("")).not.toMatch(/working/);
 	});
 });

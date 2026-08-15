@@ -1733,9 +1733,35 @@ describe("verifyTurn maker/checker/failsafe loop", () => {
 			model: modelWithId("deepseek/deepseek-v4-flash-0731"),
 			convertToLlm: identityConverter,
 			verifyTurn: async () => ({
-				status: "verified",
+				status: "unverified",
 				notice: "[VERIFY] UNVERIFIED — final answer accepted on checker budget",
 			}),
+		};
+
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+		const stream = agentLoop([createUserMessage("go")], context, config, undefined, recordingStreamFn([]));
+		const userMessages: string[] = [];
+		let noticeSeenBeforeEnd = false;
+		for await (const event of stream) {
+			if (event.type === "message_start" && event.message.role === "user") {
+				userMessages.push(typeof event.message.content === "string" ? event.message.content : "");
+			}
+			if (event.type === "agent_end") {
+				noticeSeenBeforeEnd = userMessages.some((m) => m.includes("[VERIFY] UNVERIFIED"));
+			}
+		}
+		const messages = await stream.result();
+		expect(noticeSeenBeforeEnd).toBe(true);
+		expect(messages.some((m) => m.role === "user" && String(m.content).includes("[VERIFY] UNVERIFIED"))).toBe(true);
+	});
+
+	it("surfaces UNVERIFIED when verifyTurn throws instead of ending silently", async () => {
+		const config: AgentLoopConfig = {
+			model: modelWithId("deepseek/deepseek-v4-flash-0731"),
+			convertToLlm: identityConverter,
+			verifyTurn: async () => {
+				throw new Error("checker exploded");
+			},
 		};
 
 		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
@@ -2028,5 +2054,85 @@ describe("mid-build plan/checkpoint routing in agent loop", () => {
 		expect(modelCalls[0]).toBe("deepseek/deepseek-v4-flash-0731");
 		expect(modelCalls).toContain("openai/gpt-5.6-luna");
 		expect(modelCalls.filter((id) => id === "deepseek/deepseek-v4-flash-0731").length).toBeGreaterThanOrEqual(3);
+	});
+
+	it("on checkpoint unverified, injects the notice and keeps building (does not stop)", async () => {
+		const modelCalls: string[] = [];
+		let makerTurns = 0;
+		const streamFn = (model: Model<any>) => {
+			modelCalls.push(model.id);
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (model.id === "openai/gpt-5.6-luna") {
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "AMBIGUOUS" }]),
+					});
+					return;
+				}
+				makerTurns++;
+				if (makerTurns === 1) {
+					stream.push({
+						type: "done",
+						reason: "toolUse",
+						message: createAssistantMessage([
+							{
+								type: "toolCall",
+								id: "call_1",
+								name: "bash",
+								arguments: { command: "ls" },
+							},
+						]),
+					});
+				} else {
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "finished after unverified checkpoint" }]),
+					});
+				}
+			});
+			return stream;
+		};
+
+		let checkpoints = 0;
+		let agentEnded = false;
+		const notices: string[] = [];
+		const config: AgentLoopConfig = {
+			model: modelWithId("deepseek/deepseek-v4-flash-0731"),
+			convertToLlm: identityConverter,
+			shouldCheckpoint: ({ toolTurnCount }) => toolTurnCount === 1,
+			verifyTurn: async (ctx) => {
+				if (ctx.kind === "checkpoint") {
+					checkpoints++;
+					await ctx.runModel(modelWithId("openai/gpt-5.6-luna"), [
+						{ role: "user", content: "audit", timestamp: Date.now() },
+					]);
+					return {
+						status: "unverified",
+						notice: "[VERIFY] UNVERIFIED — checkpoint audit was ambiguous",
+					};
+				}
+				return { status: "verified" };
+			},
+		};
+
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [bashTool] };
+		const stream = agentLoop([createUserMessage("build")], context, config, undefined, streamFn);
+		for await (const event of stream) {
+			if (event.type === "message_start" && event.message.role === "user") {
+				const text = typeof event.message.content === "string" ? event.message.content : "";
+				if (text.includes("[VERIFY] UNVERIFIED")) notices.push(text);
+			}
+			if (event.type === "agent_end") agentEnded = true;
+		}
+		await stream.result();
+
+		expect(checkpoints).toBe(1);
+		expect(notices.some((n) => n.includes("checkpoint audit was ambiguous"))).toBe(true);
+		expect(makerTurns).toBeGreaterThanOrEqual(2);
+		expect(agentEnded).toBe(true);
+		expect(modelCalls.filter((id) => id === "deepseek/deepseek-v4-flash-0731").length).toBeGreaterThanOrEqual(2);
 	});
 });

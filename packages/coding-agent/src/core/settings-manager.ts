@@ -70,12 +70,14 @@ export interface WarningSettings {
  * Maker/checker/planner verification routing.
  *
  * When `checkerModel` is set, every turn that ends without tool calls (a
- * candidate final answer) is audited by the checker model. On conflict the
- * turn is retried by the maker with corrective feedback; on the Nth
- * consecutive rejection the planner model decomposes the problem into a plan
- * that the maker then executes (plan with a higher model, build with a lower
- * one). Model refs accept "provider/id" (e.g. "openrouter/z-ai/glm-5.2") or a
- * bare model id resolved against the runtime.
+ * candidate final answer) is audited by the checker model. The checker opens
+ * its reply with an isolated verdict line (`VERDICT: <enum>` or a bare
+ * `VERIFIED`/`CONFLICT` first line); the verdict is parsed from that line, not
+ * scanned from the rationale. On conflict the turn is retried by the maker
+ * with corrective feedback; on the Nth consecutive rejection the planner model
+ * decomposes the problem into a plan that the maker then executes (plan with a
+ * higher model, build with a lower one). Model refs accept "provider/id"
+ * (e.g. "openrouter/z-ai/glm-5.2") or a bare model id resolved against the runtime.
  */
 export interface VerifySettings {
 	/**
@@ -148,6 +150,8 @@ export interface VerifySettings {
 		enabled?: boolean;
 		/** Model ref for the triage call (default: the base maker). */
 		model?: string;
+		/** Thinking level for the classifier call (default: "off"). */
+		thinkingLevel?: ThinkingLevel;
 	};
 	/**
 	 * Stronger planner used for hard-tier plans and post-rejection re-plans
@@ -158,6 +162,7 @@ export interface VerifySettings {
 	/** Per-tier stage overrides applied when triage classifies a run. */
 	tiers?: {
 		trivial?: VerifyTierOverrides;
+		standard?: VerifyTierOverrides;
 		hard?: VerifyTierOverrides;
 	};
 	/** Max harness-executed RUN: commands per checker audit (default: 2). */
@@ -171,11 +176,45 @@ export interface VerifySettings {
 	makerFallbackModel?: string;
 	checkerFallbackModel?: string;
 	/**
+	 * Thinking level for the spare checker (default: checkerThinkingLevel).
+	 * Pin this to the spare plug's rated effort — it is often a different
+	 * company with a different effort ladder than the primary checker.
+	 */
+	checkerFallbackThinkingLevel?: ThinkingLevel;
+	/**
 	 * Once retries escalate the maker, keep the escalated maker for the rest of
 	 * the run instead of demoting on the next verified checkpoint (default:
 	 * true). Prevents fail→escalate→pass→demote→fail ping-pong.
 	 */
 	stickyEscalation?: boolean;
+	/**
+	 * Whole-run hard ceiling on maker turns (F-01). Exhaustion emits a visible
+	 * `[VERIFY] STOPPED_UNVERIFIED` notice and ends the run — never a silent
+	 * pass. 0 = unlimited (legacy behavior; not recommended).
+	 */
+	maxMakerTurns?: number;
+	/**
+	 * Whole-run hard ceiling on total tool calls across all maker turns (F-01).
+	 * 0 = unlimited.
+	 */
+	maxToolCallsPerRun?: number;
+	/**
+	 * Whole-run wall-clock deadline in milliseconds (F-01). 0 = unlimited.
+	 */
+	maxRunMs?: number;
+	/**
+	 * Whole-run total-cost ceiling in USD, summing verify-path + maker calls
+	 * tracked by the routing layer (F-01). 0 = unlimited.
+	 */
+	maxRunCostUsd?: number;
+	/**
+	 * Policy when a checker is unavailable or persistently ambiguous (F-03).
+	 * `surface-unverified` (default): accept the answer but emit a user-visible
+	 * `[VERIFY] UNVERIFIED` notice and a run-summary, never a silent pass.
+	 * `fail-closed`: reject the answer and force a re-plan/retry if budget
+	 * remains, else stop with a visible STOPPED_UNVERIFIED.
+	 */
+	unavailablePolicy?: "surface-unverified" | "fail-closed";
 }
 
 /**
@@ -196,6 +235,11 @@ export interface VerifyTierOverrides {
 	checkpointEveryToolTurns?: number;
 	escalationMakerModel?: string;
 	escalationMakerThinkingLevel?: ThinkingLevel;
+	/** Per-tier checker fallback (F-08/P1): for hard tier, this should be a
+	 * different family from the hard maker to preserve independence. */
+	checkerFallbackModel?: string;
+	/** Per-tier thinking level for the spare checker. */
+	checkerFallbackThinkingLevel?: ThinkingLevel;
 }
 
 export type DefaultProjectTrust = "ask" | "always" | "never";

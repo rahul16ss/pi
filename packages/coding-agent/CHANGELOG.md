@@ -90,10 +90,22 @@
 ### Added
 
 - Added a fullscreen exit output setting to choose between printing the final transcript and only a session resume hint.
+- **Whole-run stop conditions** (finding F-01): `maxMakerTurns`, `maxToolCallsPerRun`, `maxRunMs`, and `maxRunCostUsd` in `VerifySettings` bound a run hard. Exhaustion emits a visible `[VERIFY] STOPPED_UNVERIFIED` notice and ends the run — never a silent pass.
+- **Explicit unverified policy** (finding F-03): `unavailablePolicy` in `VerifySettings` (`surface-unverified` default, `fail-closed` alternative). Unavailable or persistently ambiguous checkers now surface a user-visible `[VERIFY] UNVERIFIED` notice and a terminal `run-summary` instead of returning `undefined` (silent fail-open).
+- **Run identity + trace envelope** (finding F-07): every audit event now carries `runId` and `schema: 2`, so traces can be reconstructed across sessions. `run-summary` now includes `makerTurns`, `toolCallsTotal`, and `elapsedMs`. The `installed` event logs all resolved bounds and the unavailable policy.
+- **Leading-token verdict stage** for the checker parser (F-05 same-line case): a first line that leads with `VERIFIED.`/`CONFLICT.` followed by rationale on the same line is now treated as the verdict, closing the gap the isolated-line rules missed.
 
 ### Changed
 
 - Replaced the inherited Mistral SDK transport with a native Chat Completions HTTP stream, eliminating its generated client and schema runtime overhead.
+- Checker verdicts are now read from an isolated first line (`VERDICT: <enum>` or a bare `VERIFIED`/`CONFLICT` line) instead of scanning the full reply, so a checker's reasoning is never mistaken for its verdict; each audit event logs which stage decided it (`verdictVia`). The legacy trailing-verdict scan is retained only as a compatibility fallback so genuine rejections never fail open.
+- Model routing pruned to three OpenRouter plugs: `gpt-5.6-luna` (hard maker, escalation, and primary checker), `deepseek-v4-flash-0731` (triage, everyday maker, maker fallback), and `moonshotai/kimi-k3` (third-family spare checker, not a daily enabledModel). No more expensive Anthropic/Moonshot/Zhipu routes leaking in via fallbacks or demotion.
+
+### Fixed
+
+- Fixed false maker rejections caused by the checker verdict prose scan (finding F-05): a reply that opened with `VERIFIED` and later quoted the rejection criterion ("the CONFLICT criterion was not met") was recorded as a rejection, wasting a full maker+checker cycle. The same-line variant (`VERIFIED. <rationale>`) is now also caught.
+- Fixed silent fail-open on checker outage or ambiguous verdict (finding F-03): the user now always sees `[VERIFY] UNVERIFIED` when the checker never signed off, instead of the answer exiting normally with no notice.
+- Fixed the broken gauntlet M1 metric (finding F-14): the previous inline `node -e` one-liner iterated a joined conflict-text string character-by-character, so it clustered characters ("V", "E", "R") instead of conflict records. Replaced with a tested `recurring-conflicts.mjs` module that clusters records by stable category id.
 
 ## [0.84.1] - 2026-08-07
 

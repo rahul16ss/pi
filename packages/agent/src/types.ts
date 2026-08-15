@@ -223,6 +223,25 @@ export type TurnVerifyResult =
 			notice?: string;
 	  }
 	| {
+			/**
+			 * The answer is accepted but NOT verified — the checker was
+			 * unavailable, ambiguous, or a run bound fired. The loop ends like
+			 * `verified` (the answer is returned to the user), but the
+			 * `notice` is injected as a *prominent* user-visible message so it
+			 * cannot be mistaken for a clean pass. Audit P1-3.
+			 */
+			status: "unverified";
+			/** Optional model to switch to (e.g. demote from escalated maker). */
+			model?: Model<any>;
+			/** Optional thinking level to apply with `model`. */
+			thinkingLevel?: ThinkingLevel;
+			/**
+			 * Mandatory user-visible notice injected as a prominent message
+			 * before the loop ends. Always starts with `[VERIFY]`.
+			 */
+			notice: string;
+	  }
+	| {
 			status: "rejected";
 			/** User message injected before the next turn (the corrective feedback). */
 			correctivePrompt: string;

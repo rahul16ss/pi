@@ -7,6 +7,7 @@
  */
 
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
+import { APP_NAME } from "../config.ts";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
 import { flushRawStdout, waitForRawStdoutBackpressure, writeRawStdout } from "../core/output-guard.ts";
 import { killTrackedDetachedChildren } from "../utils/shell.ts";
@@ -24,6 +25,20 @@ export interface PrintModeOptions {
 	initialMessage?: string;
 	/** Images to attach to the initial message */
 	initialImages?: ImageContent[];
+}
+
+/**
+ * Brief stderr heartbeat for text print mode so a long run is not silent.
+ * Never dumps tool payloads (write contents, bash output).
+ */
+export function formatPrintProgress(event: { type: string; toolName?: string; args?: unknown }): string | undefined {
+	if (event.type === "turn_start") return `${APP_NAME}: working…`;
+	if (event.type !== "tool_execution_start" || !event.toolName) return undefined;
+	const args = event.args && typeof event.args === "object" ? (event.args as Record<string, unknown>) : {};
+	const path = typeof args.path === "string" ? args.path : undefined;
+	const command = typeof args.command === "string" ? args.command.replace(/\s+/g, " ").slice(0, 80) : undefined;
+	const detail = path ?? command;
+	return detail ? `${APP_NAME}: ${event.toolName} ${detail}` : `${APP_NAME}: ${event.toolName}`;
 }
 
 /**
@@ -108,7 +123,10 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		unsubscribe = session.subscribe((event) => {
 			if (mode === "json") {
 				writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`);
+				return;
 			}
+			const line = formatPrintProgress(event);
+			if (line) process.stderr.write(`${line}\n`);
 		});
 		unsubscribeBackpressure =
 			mode === "json"
