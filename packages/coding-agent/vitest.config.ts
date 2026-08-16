@@ -14,6 +14,9 @@ export default mergeConfig(
 			unstubEnvs: true,
 			reporters: process.env.GITHUB_ACTIONS ? ["dot", "github-actions"] : ["dot"],
 			silent: "passed-only",
+			// gauntlet-extension.test.ts imports from ~/.pi/agent/extensions/gauntlet.ts
+			// which only exists on the user's machine, not on CI.
+			exclude: ["**/gauntlet-extension.test.ts", "**/node_modules/**", "**/dist/**"],
 			server: {
 				deps: {
 					external: [/@silvia-odwyer\/photon-node/],
