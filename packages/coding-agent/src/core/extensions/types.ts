@@ -344,6 +344,11 @@ export interface ExtensionContext {
 	compact(options?: CompactOptions): void;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string;
+	/**
+	 * Wait for the agent to finish streaming. Available in all contexts
+	 * (no-op when the agent is already idle).
+	 */
+	waitForIdle(): Promise<void>;
 }
 
 /**
