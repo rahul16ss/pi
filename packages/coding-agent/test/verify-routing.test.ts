@@ -1,4 +1,5 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage, BeforeFirstTurnContext, VerifyTurnContext } from "@earendil-works/pi-agent-core";
@@ -15,14 +16,17 @@ import {
 	createVerifyRouting,
 	EXCELLENCE_CHARTER,
 	extractModelFamily,
+	gatherDiffEvidence,
 	messageText,
 	parseCheckerVerdict,
+	readUntrackedFile,
 	redactEvidence,
 	selectAuditChecker,
 	shouldEscalateMaker,
 	shouldPlanFirst,
 	shouldRunCheckpoint,
 	tallyMakerTrace,
+	UNTRACKED_FILE_MAX_BYTES,
 } from "../src/core/verify-routing.ts";
 
 function modelWithId(id: string): Model<any> {
@@ -1539,5 +1543,56 @@ describe("redactEvidence", () => {
 		const aws = "AKIA" + "ABCDEFGHJKLMNPQRS";
 		expect(redactEvidence(aws)).not.toContain(aws);
 		expect(redactEvidence(aws)).toMatch(/REDACTED/i);
+	});
+});
+
+describe("readUntrackedFile", () => {
+	const dirs: string[] = [];
+	afterEach(() => {
+		for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+	});
+
+	function gitRepo(): string {
+		const dir = mkdtempSync(join(tmpdir(), "pi-untracked-"));
+		dirs.push(dir);
+		execSync("git init", { cwd: dir, stdio: "ignore" });
+		execSync('git config user.email "eval@test"', { cwd: dir, stdio: "ignore" });
+		execSync('git config user.name "eval"', { cwd: dir, stdio: "ignore" });
+		writeFileSync(join(dir, "tracked.txt"), "old\n");
+		execSync("git add tracked.txt && git commit --no-gpg-sign -m init", { cwd: dir, stdio: "ignore" });
+		return dir;
+	}
+
+	it("reads a regular untracked file", () => {
+		const dir = gitRepo();
+		writeFileSync(join(dir, "new.ts"), "export const n = 1;\n");
+		expect(readUntrackedFile(dir, "new.ts")).toContain("export const n = 1");
+	});
+
+	it("does not follow a symlink out of the workspace", () => {
+		const dir = gitRepo();
+		const outside = mkdtempSync(join(tmpdir(), "pi-outside-"));
+		dirs.push(outside);
+		writeFileSync(join(outside, "secret.txt"), "outside-secret\n");
+		symlinkSync(join(outside, "secret.txt"), join(dir, "link.txt"));
+		expect(readUntrackedFile(dir, "link.txt")).toBe("");
+	});
+
+	it("skips FIFOs instead of blocking on an unbounded read", () => {
+		if (process.platform === "win32") return;
+		const dir = gitRepo();
+		execSync("mkfifo pipe.fifo", { cwd: dir, stdio: "ignore" });
+		expect(readUntrackedFile(dir, "pipe.fifo")).toBe("");
+		const evidence = gatherDiffEvidence(dir, "final");
+		expect(evidence).not.toMatch(/outside-secret|blocked-on-fifo/);
+	});
+
+	it("does not load oversized regular files into checker evidence", () => {
+		const dir = gitRepo();
+		const huge = Buffer.alloc(UNTRACKED_FILE_MAX_BYTES + 1, 0x61);
+		writeFileSync(join(dir, "huge.txt"), huge);
+		const body = readUntrackedFile(dir, "huge.txt");
+		expect(body).toMatch(/\[\.\.\. \d+ more chars \.\.\.\]/);
+		expect(body).not.toContain("aaa");
 	});
 });

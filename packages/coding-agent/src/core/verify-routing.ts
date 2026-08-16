@@ -31,7 +31,7 @@
  */
 
 import { execFileSync, execSync } from "node:child_process";
-import { appendFileSync, readFileSync, realpathSync } from "node:fs";
+import { appendFileSync, lstatSync, readFileSync, realpathSync, type Stats } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type {
 	AgentLoopTurnUpdate,
@@ -573,19 +573,34 @@ function guardedExec(cwd: string, command: string, timeout = 2_000): string {
 	}
 }
 
+/** Cap untracked reads so a FIFO, device, or huge file cannot hang or OOM the checker. */
+export const UNTRACKED_FILE_MAX_BYTES = 1_048_576;
+
+function isUnsafeUntrackedTarget(stat: Stats): boolean {
+	return stat.isFIFO() || stat.isSocket() || stat.isCharacterDevice() || stat.isBlockDevice() || stat.isDirectory();
+}
+
 /** Read an untracked file without interpolating its name into a shell command.
  * Resolves symlinks so an in-repo link targeting a file outside the repo
- * cannot leak external content to the checker. */
+ * cannot leak external content to the checker. Skips FIFOs, devices, sockets,
+ * and directories. Oversized regular files return a truncation marker instead
+ * of being read in full. */
 export function readUntrackedFile(cwd: string, file: string): string {
 	if (!file || file.includes("\0") || isAbsolute(file)) return "";
 	const resolved = resolve(cwd, file);
 	const rel = relative(cwd, resolved);
 	if (!rel || rel.startsWith("..") || isAbsolute(rel)) return "";
 	try {
-		// Resolve symlinks and re-check containment on the real target.
+		const linkStat = lstatSync(resolved);
+		if (isUnsafeUntrackedTarget(linkStat)) return "";
 		const real = realpathSync(resolved);
 		const realRel = relative(realpathSync(cwd), real);
 		if (!realRel || realRel.startsWith("..") || isAbsolute(realRel)) return "";
+		const targetStat = lstatSync(real);
+		if (!targetStat.isFile() || isUnsafeUntrackedTarget(targetStat)) return "";
+		if (targetStat.size > UNTRACKED_FILE_MAX_BYTES) {
+			return `[... ${Number(targetStat.size)} more chars ...]\n`;
+		}
 		return readFileSync(real, { encoding: "utf8" });
 	} catch {
 		return "";
