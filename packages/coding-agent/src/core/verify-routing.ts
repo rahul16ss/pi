@@ -873,7 +873,14 @@ function takeWithMarker(text: string, budget: number, marker: string): { text: s
 function listUntracked(cwd: string): string[] {
 	const raw = guardedGit(cwd, ["ls-files", "-z", "--others", "--exclude-standard"], 3_000);
 	if (!raw) return [];
-	return raw.split("\0").filter(Boolean).slice(0, 40);
+	return raw.split("\0").filter(Boolean);
+}
+
+const UNTRACKED_READ_CAP = 40;
+
+function takeUntracked(files: string[], cap: number): { files: string[]; omitted: number } {
+	if (files.length <= cap) return { files, omitted: 0 };
+	return { files: files.slice(0, cap), omitted: files.length - cap };
 }
 
 function formatUntracked(files: string[], cwd: string): string {
@@ -916,6 +923,8 @@ export function gatherDiffEvidence(cwd: string, kind: VerifyKind, opts: DiffEvid
 	const untracked = listUntracked(cwd).filter((f) => !skipUntracked.has(f));
 	const focusUntracked = focusSet.size === 0 ? untracked : untracked.filter((f) => focusSet.has(f));
 	const otherUntracked = focusSet.size === 0 ? [] : untracked.filter((f) => !focusSet.has(f));
+	const focusTake = takeUntracked(focusUntracked, UNTRACKED_READ_CAP);
+	const otherTake = takeUntracked(otherUntracked, 20);
 
 	const goalDiff =
 		focusPaths.length > 0
@@ -934,15 +943,21 @@ export function gatherDiffEvidence(cwd: string, kind: VerifyKind, opts: DiffEvid
 				: `git diff HEAD (working tree, tracked changes):\n${goalDiff}`,
 		);
 	}
-	const goalUntracked = formatUntracked(focusUntracked, cwd);
+	const goalUntracked = formatUntracked(focusTake.files, cwd);
 	if (goalUntracked) {
 		goalChunks.push(`Untracked new files (not in git diff HEAD, shown separately):\n${goalUntracked}`);
+	}
+	if (focusTake.omitted > 0) {
+		goalChunks.push(`${GOAL_DIFF_TRUNCATION_MARKER}\n[${focusTake.omitted} more untracked goal files not shown]`);
 	}
 
 	const otherChunks: string[] = [];
 	if (otherDiff) otherChunks.push(`git diff HEAD (other working-tree files):\n${otherDiff}`);
-	const otherUntrackedBody = formatUntracked(otherUntracked.slice(0, 20), cwd);
+	const otherUntrackedBody = formatUntracked(otherTake.files, cwd);
 	if (otherUntrackedBody) otherChunks.push(`Other untracked files:\n${otherUntrackedBody}`);
+	if (otherTake.omitted > 0) {
+		otherChunks.push(`${OTHER_DIFF_TRUNCATION_MARKER}\n[${otherTake.omitted} more untracked files not shown]`);
+	}
 
 	const overview = overviewParts.join("\n\n");
 	const packed: string[] = overview ? [overview] : [];

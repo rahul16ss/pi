@@ -15,7 +15,9 @@ import {
 	classifyTriageTier,
 	createVerifyRouting,
 	EXCELLENCE_CHARTER,
+	evidenceTruncationBlocksVerified,
 	extractModelFamily,
+	GOAL_DIFF_TRUNCATION_MARKER,
 	gatherDiffEvidence,
 	messageText,
 	parseCheckerVerdict,
@@ -1615,5 +1617,26 @@ describe("readUntrackedFile", () => {
 		mkdirSync(join(dir, "nested"));
 		writeFileSync(join(dir, "nested", "inside.ts"), "export const hidden = 1;\n");
 		expect(readUntrackedFile(dir, "nested")).toBe("");
+	});
+
+	it("still shows a goal untracked file when 40 other untracked names sort first", () => {
+		const dir = gitRepo();
+		for (let i = 0; i < 40; i++) {
+			writeFileSync(join(dir, `aaa-${String(i).padStart(2, "0")}.txt`), "noise\n");
+		}
+		writeFileSync(join(dir, "zzz-goal.ts"), "export const goal = 1;\n");
+		const evidence = gatherDiffEvidence(dir, "final", { focusPaths: ["zzz-goal.ts"] });
+		expect(evidence).toContain("export const goal = 1");
+		expect(evidenceTruncationBlocksVerified(evidence)).toBe(false);
+	});
+
+	it("marks omitted untracked files so a silent VERIFIED is illegal", () => {
+		const dir = gitRepo();
+		for (let i = 0; i < 41; i++) {
+			writeFileSync(join(dir, `u${String(i).padStart(2, "0")}.txt`), `body-${i}\n`);
+		}
+		const evidence = gatherDiffEvidence(dir, "final");
+		expect(evidence).toContain(GOAL_DIFF_TRUNCATION_MARKER);
+		expect(evidenceTruncationBlocksVerified(evidence)).toBe(true);
 	});
 });
