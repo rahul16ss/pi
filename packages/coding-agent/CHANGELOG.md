@@ -1,5 +1,28 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Whole-run stop conditions (`maxMakerTurns`, `maxToolCallsPerRun`, `maxRunMs`, `maxRunCostUsd`) emit `[VERIFY] STOPPED_UNVERIFIED` instead of a silent pass.
+- Explicit unverified policy: unavailable or ambiguous checkers surface `[VERIFY] UNVERIFIED` and a terminal `run-summary`.
+- Every audit event carries `runId` and `schema: 2`. Checker verdicts are read from an isolated first line (`VERDICT:` or a bare `VERIFIED`/`CONFLICT` line).
+- Model routing uses three OpenRouter plugs: `gpt-5.6-luna` (hard maker, escalation, and primary checker), `deepseek-v4-flash-0731` (triage, everyday maker, maker fallback), and `moonshotai/kimi-k3` (third-family spare checker).
+
+### Fixed
+
+- Final verification now skips untracked FIFOs, sockets, and device files, and substitutes a truncation marker for regular files larger than 1 MiB, so checker evidence gathering cannot hang or grow without bound.
+- Untracked symlink targets outside the workspace are no longer forwarded to the checker.
+- Untracked reads open the resolved path with `O_NOFOLLOW`/`O_NONBLOCK`, re-check the kernel path of that descriptor against the workspace, and `fstat` it before reading, so a concurrent replacement cannot swap in a symlink, FIFO, oversized file, or outside-workspace target after the path checks.
+- Untracked file names are enumerated in full and treated as goal evidence (tool-touched names packed first). Omitted untracked files emit the goal truncation marker so a checker cannot VERIFIED a bash-created artifact it never saw.
+- The gauntlet M1 metric clusters conflict records rather than characters.
+- Wall-clock `maxRunMs` is no longer a default hurdle (0 = unlimited). Live `maxRunCostUsd` is 100, not 5.
+- Verifier commands refuse to run when no `package.json` exists above cwd (home-folder `npm test` exit 254).
+- `shouldStopAfterTurn` notices are emitted to the TUI instead of being stuffed into the transcript silently.
+- Continue / health-audit / self-test prompts are floored off TRIVIAL so planning still runs.
+- Audit/health goals can VERIFIED on evidenced findings even when product tests are red.
+- Mutating bash (sed, redirects, interpreters) treats every dirty tracked file as goal evidence so a bash-edited artifact cannot hide in otherDiff.
+
 ## [0.84.2] - 2026-08-14
 
 ### New Features
@@ -55,45 +78,6 @@
 - Fixed split `Alt+Enter` input over SSH being misread as Escape, added `PI_TUI_ESC_TIMEOUT` for high-latency terminals, and limited that timeout to lone Escape input ([#7899](https://github.com/earendil-works/pi/pull/7899) by [@powerfooI](https://github.com/powerfooI)).
 - Fixed inherited idle fullscreen sessions repainting and clearing text selection when the terminal loses focus ([#7892](https://github.com/earendil-works/pi/pull/7892) by [@terrorobe](https://github.com/terrorobe)).
 - Fixed fullscreen selection copy to use the host clipboard and report failure instead of claiming success when OSC 52 is unsupported ([#8110](https://github.com/earendil-works/pi/pull/8110) by [@Panoplos](https://github.com/Panoplos)).
-
-## [0.84.1] - 2026-08-07
-
-### New Features
-
-- **Qwen Token Plan Individual** — Use the built-in provider for models documented for Individual subscriptions. See [API Keys](docs/providers.md#api-keys).
-- **Authentication readiness checks** — Use `pi auth check` to verify provider or model credentials, optionally emitting the resolved credential.
-- **Improved fullscreen interaction** — Select words and paragraphs with multiple clicks and configure half-page transcript scrolling. See [TUI Fullscreen Viewport](docs/keybindings.md#tui-fullscreen-viewport).
-- **Terminating blocked tool calls** — Extension `tool_call` handlers can stop all-terminating batches without another model call. See [Tool Events](docs/extensions.md#tool-events).
-
-### Added
-
-- Added Qwen Token Plan Individual as a built-in provider with its documented subscription model catalog and the shared international `QWEN_TOKEN_PLAN_API_KEY`. See [API Keys](docs/providers.md#api-keys) ([#7659](https://github.com/earendil-works/pi/pull/7659) by [@arasovic](https://github.com/arasovic)).
-- Added `pi auth check` provider/model auth preflight with optional credential output ([#7152](https://github.com/earendil-works/pi/issues/7152)).
-- Added `terminate` support to blocked extension `tool_call` events so all-terminating batches can skip the automatic follow-up model call. See [Tool Events](docs/extensions.md#tool-events) ([#7715](https://github.com/earendil-works/pi/pull/7715) by [@muyiyr](https://github.com/muyiyr)).
-- Added inherited double-click word and whitespace selection, granularity-aware drag selection, and triple-click paragraph selection in fullscreen mode ([#7725](https://github.com/earendil-works/pi/issues/7725), [#7733](https://github.com/earendil-works/pi/pull/7733) by [@volsa](https://github.com/volsa)).
-- Added inherited unbound half-page transcript scrolling actions for fullscreen mode. See [TUI Fullscreen Viewport](docs/keybindings.md#tui-fullscreen-viewport) ([#7735](https://github.com/earendil-works/pi/issues/7735)).
-
-### Changed
-
-- Softened the bash tool's `PI_*` environment guideline in an attempt to reduce unnecessary inspection commands ([#7128](https://github.com/earendil-works/pi/issues/7128)).
-- Reduced worst-case automatic terminal theme detection delay from 200 ms to 100 ms by probing color-scheme and background support concurrently.
-
-### Fixed
-
-- Fixed Bun standalone binaries crashing on startup when the cwd contains a `bunfig.toml` with `preload` by compiling with `--no-compile-autoload-bunfig` ([#7685](https://github.com/earendil-works/pi/pull/7685) by [@geril07](https://github.com/geril07)).
-- Fixed extension TUI method wrappers recursing indefinitely when delegating to the original method ([#7731](https://github.com/earendil-works/pi/issues/7731)).
-- Fixed right-click not pasting clipboard text in fullscreen mode on Windows.
-- Fixed inherited `Agent.reset()` clearing transcript and runtime state during active runs; it now rejects until the agent is idle ([#7717](https://github.com/earendil-works/pi/pull/7717) by [@wesleyzhangwq](https://github.com/wesleyzhangwq)).
-- Fixed inherited LaTeX relation, multiplication, and named-operator spacing, and matrix composition with stacked fractions, operator limits, and adjacent matrices.
-- Reduced inherited fullscreen mouse event volume under tmux, Zellij, and GNU Screen by using button-motion tracking instead of all-motion tracking.
-
-### Added
-
-- Added a fullscreen exit output setting to choose between printing the final transcript and only a session resume hint.
-
-### Changed
-
-- Replaced the inherited Mistral SDK transport with a native Chat Completions HTTP stream, eliminating its generated client and schema runtime overhead.
 
 ## [0.84.1] - 2026-08-07
 

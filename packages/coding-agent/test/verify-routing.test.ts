@@ -1,4 +1,5 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage, BeforeFirstTurnContext, VerifyTurnContext } from "@earendil-works/pi-agent-core";
@@ -6,16 +7,33 @@ import type { AssistantMessage, Model } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it } from "vitest";
 import type { VerifySettings } from "../src/core/settings-manager.ts";
 import {
+	boundContextForModel,
+	buildTriagePrompt,
+	CHECKER_VERDICT_LINE_INSTRUCTION,
 	checkerRefForKind,
 	classifyCheckerVerdict,
 	classifyTriageTier,
+	collectTouchedPaths,
 	createVerifyRouting,
 	EXCELLENCE_CHARTER,
-	isConversationalPrompt,
+	evidenceTruncationBlocksVerified,
+	extractModelFamily,
+	floorTriageTier,
+	GOAL_DIFF_TRUNCATION_MARKER,
+	gatherDiffEvidence,
+	isDiscoveryAuditGoal,
 	messageText,
+	OTHER_DIFF_TRUNCATION_MARKER,
+	parseCheckerVerdict,
+	readUntrackedFile,
+	redactEvidence,
+	resolveVerifierCwd,
+	selectAuditChecker,
 	shouldEscalateMaker,
 	shouldPlanFirst,
 	shouldRunCheckpoint,
+	tallyMakerTrace,
+	UNTRACKED_FILE_MAX_BYTES,
 } from "../src/core/verify-routing.ts";
 
 function modelWithId(id: string): Model<any> {
@@ -33,7 +51,7 @@ function modelWithId(id: string): Model<any> {
 	};
 }
 
-function assistant(text: string, modelId = "mock"): AssistantMessage {
+function assistant(text: string, modelId = "mock", extra: Partial<AssistantMessage> = {}): AssistantMessage {
 	return {
 		role: "assistant",
 		content: [{ type: "text", text }],
@@ -50,6 +68,7 @@ function assistant(text: string, modelId = "mock"): AssistantMessage {
 		},
 		stopReason: "stop",
 		timestamp: Date.now(),
+		...extra,
 	};
 }
 
@@ -64,6 +83,54 @@ function toolResult(toolName: string, text: string): AgentMessage {
 	};
 }
 
+describe("extractModelFamily / selectAuditChecker", () => {
+	it("treats openrouter-prefixed ids as the inner company family", () => {
+		expect(extractModelFamily("openrouter/openai/gpt-5.6-luna")).toBe("openai");
+		expect(extractModelFamily("openai/gpt-5.6-luna")).toBe("openai");
+		expect(extractModelFamily("openrouter/deepseek/deepseek-v4-pro-0813")).toBe("deepseek");
+	});
+
+	it("keeps an independent spare as availability fallback", () => {
+		const pick = selectAuditChecker({
+			liveMakerRef: "openrouter/deepseek/deepseek-v4-pro-0813",
+			checkerRef: "openrouter/openai/gpt-5.6-luna",
+			checkerFallbackRef: "openrouter/meta/muse-spark-1.2",
+		});
+		expect(pick.primaryRef).toContain("gpt-5.6-luna");
+		expect(pick.fallbackRef).toContain("muse-spark");
+		expect(pick.swapped).toBe(false);
+	});
+
+	it("promotes the spare when the live maker collides with the checker family", () => {
+		const pick = selectAuditChecker({
+			liveMakerRef: "openai/gpt-5.6-luna",
+			checkerRef: "openrouter/openai/gpt-5.6-luna",
+			checkerFallbackRef: "openrouter/meta/muse-spark-1.2",
+		});
+		expect(pick.primaryRef).toContain("muse-spark");
+		expect(pick.fallbackRef).toBeUndefined();
+		expect(pick.swapped).toBe(true);
+		expect(pick.reason).toBe("maker-family-collides-with-checker");
+	});
+
+	it("drops a spare that is the same family as the live maker or the checker", () => {
+		expect(
+			selectAuditChecker({
+				liveMakerRef: "openrouter/meta/muse-spark-1.2",
+				checkerRef: "openrouter/openai/gpt-5.6-luna",
+				checkerFallbackRef: "meta/muse-spark-1.2",
+			}).fallbackRef,
+		).toBeUndefined();
+		expect(
+			selectAuditChecker({
+				liveMakerRef: "openrouter/deepseek/deepseek-v4-pro-0813",
+				checkerRef: "openrouter/openai/gpt-5.6-luna",
+				checkerFallbackRef: "openai/gpt-5.6-luna",
+			}).fallbackRef,
+		).toBeUndefined();
+	});
+});
+
 describe("classifyCheckerVerdict", () => {
 	it("prefers CONFLICT and does not treat unverified as VERIFIED", () => {
 		expect(classifyCheckerVerdict("VERIFIED")).toBe("verified");
@@ -73,6 +140,76 @@ describe("classifyCheckerVerdict", () => {
 		expect(classifyCheckerVerdict("claims are unverified. CONFLICT")).toBe("conflict");
 		expect(classifyCheckerVerdict("")).toBe("ambiguous");
 		expect(classifyCheckerVerdict("maybe ok")).toBe("ambiguous");
+	});
+
+	it("an isolated first-line verdict is authoritative and its rationale is never scanned (F-05)", () => {
+		// Observed live on 2026-08-13: the final checker opened with VERIFIED and
+		// then quoted the rejection criterion, and the prose scan recorded a
+		// rejection — wasting a full maker+checker cycle.
+		expect(
+			classifyCheckerVerdict(
+				"VERIFIED\n\nThe receipts substantiate the claims:\n- report exists\n\nNo grounds for CONFLICT were found.",
+			),
+		).toBe("verified");
+		expect(classifyCheckerVerdict("VERIFIED\nThe CONFLICT criterion was not met.")).toBe("verified");
+		expect(classifyCheckerVerdict("VERDICT: VERIFIED\nNothing here meets CONFLICT.")).toBe("verified");
+		expect(classifyCheckerVerdict("**VERIFIED**\n\nTests ran; no CONFLICT.")).toBe("verified");
+
+		// A leading rejection verdict still rejects, whatever the rationale says.
+		expect(classifyCheckerVerdict("VERDICT: CONFLICT\nThe tests were never VERIFIED.")).toBe("conflict");
+		expect(classifyCheckerVerdict("CONFLICT\n\nThe maker never ran the suite.")).toBe("conflict");
+
+		// Provenance is reported so adoption of the structured format is measurable.
+		expect(parseCheckerVerdict("VERDICT: VERIFIED\nwhy").via).toBe("verdict-line");
+		expect(parseCheckerVerdict("VERIFIED\nwhy").via).toBe("bare-token-line");
+		expect(parseCheckerVerdict("Missing tests. CONFLICT").via).toBe("legacy-scan");
+		expect(parseCheckerVerdict("").via).toBe("empty");
+	});
+
+	it("a leading verdict token with same-line rationale is authoritative (F-05 same-line case)", () => {
+		// The exact live 2026-08-13 false-conflict event: the checker opened with
+		// "VERIFIED." and then explained on the SAME line, mentioning CONFLICT in
+		// the explanation. The isolated-line rules miss this because the rationale
+		// is on the same line as the token, not a later line. The leading-token
+		// stage treats the first word as the verdict and ignores the rest.
+		expect(
+			classifyCheckerVerdict(
+				"VERIFIED. The receipts substantiate the report. The rejection criterion CONFLICT was not triggered because the evidence is complete.",
+			),
+		).toBe("verified");
+		expect(parseCheckerVerdict("VERIFIED. The receipts substantiate the report. CONFLICT mentioned.").via).toBe(
+			"leading-token-line",
+		);
+		expect(classifyCheckerVerdict("CONFLICT. The maker never ran the suite; VERIFIED is not earned.")).toBe(
+			"conflict",
+		);
+		expect(parseCheckerVerdict("CONFLICT. The maker never ran the suite; VERIFIED is not earned.").via).toBe(
+			"leading-token-line",
+		);
+		// Markdown decoration around the token still counts.
+		expect(classifyCheckerVerdict("**VERIFIED.** Tests passed; no CONFLICT criterion met.")).toBe("verified");
+		// A leading verdict with an em-dash rationale separator.
+		expect(classifyCheckerVerdict("VERIFIED — the evidence is complete; CONFLICT does not apply.")).toBe("verified");
+
+		// Discussion of the token (no sentence terminator after it) is NOT a verdict.
+		// "VERIFIED is required" and "VERIFIED claims" are prose about the token,
+		// not a verdict — they must fall through to legacy-scan so CONFLICT still wins.
+		expect(parseCheckerVerdict("VERIFIED is required by the rubric. CONFLICT found.").via).toBe("legacy-scan");
+		expect(classifyCheckerVerdict("VERIFIED is required by the rubric. CONFLICT found.")).toBe("conflict");
+		expect(parseCheckerVerdict("VERIFIED claims in the log are false. CONFLICT").via).toBe("legacy-scan");
+		expect(classifyCheckerVerdict("VERIFIED claims in the log are false. CONFLICT")).toBe("conflict");
+	});
+
+	it("keeps the legacy trailing-verdict protocol working so real rejections never fail open", () => {
+		// The pre-existing prompt asked for "the specific problem, then the word
+		// CONFLICT", so trailing verdicts must keep classifying or genuine
+		// rejections would degrade to ambiguous (which fails open).
+		expect(classifyCheckerVerdict("Missing tests. CONFLICT")).toBe("conflict");
+		expect(classifyCheckerVerdict("Looks good.\nVERIFIED")).toBe("verified");
+		// An injected pass token inside quoted evidence must not manufacture a pass.
+		expect(classifyCheckerVerdict("The log claims 'VERIFIED' but the suite failed. CONFLICT")).toBe("conflict");
+		// A verdict-shaped line that is not isolated is not a verdict line.
+		expect(parseCheckerVerdict("The rubric says VERDICT: VERIFIED is required. CONFLICT").via).toBe("legacy-scan");
 	});
 
 	it("never reads a negated or hedged VERIFIED as a pass", () => {
@@ -98,29 +235,80 @@ describe("classifyTriageTier", () => {
 	});
 });
 
-describe("isConversationalPrompt", () => {
-	it("catches greetings and acknowledgments, not real tasks", () => {
-		expect(isConversationalPrompt("hi")).toBe(true);
-		expect(isConversationalPrompt("thanks, looks great!")).toBe(true);
-		expect(isConversationalPrompt("ok")).toBe(true);
-		expect(isConversationalPrompt("got it")).toBe(true);
-		expect(isConversationalPrompt("fix the race condition in session resume")).toBe(false);
-		expect(isConversationalPrompt("refactor the settings loader to be async")).toBe(false);
+describe("buildTriagePrompt", () => {
+	it("asks the model to treat greetings as TRIVIAL, including when a name is used", () => {
+		const prompt = buildTriagePrompt({ promptText: "Hi Pi" });
+		expect(prompt).toContain("Hi Pi");
+		expect(prompt).toContain("TRIVIAL");
+		expect(prompt).toContain("greeting");
+		expect(prompt).toContain("assistant's name");
+		expect(prompt).not.toContain("A coding goal is already in progress");
 	});
 
-	it("does not treat a short real task as conversational", () => {
-		expect(isConversationalPrompt("fix the typo")).toBe(false);
-		expect(isConversationalPrompt("bump the version")).toBe(false);
-		expect(isConversationalPrompt("explain why X")).toBe(false);
-		expect(isConversationalPrompt("is this safe?")).toBe(false);
-		expect(isConversationalPrompt("review this")).toBe(false);
+	it("tells the model that an active goal's follow-up is not small talk", () => {
+		const prompt = buildTriagePrompt({ promptText: "yes", goalActive: true });
+		expect(prompt).toContain("already in progress");
+		expect(prompt).toContain("yes");
 	});
 
-	it("still treats short acknowledgments as conversational", () => {
-		expect(isConversationalPrompt("ok")).toBe(true);
-		expect(isConversationalPrompt("yes")).toBe(true);
-		expect(isConversationalPrompt("done")).toBe(true);
-		expect(isConversationalPrompt("sounds good")).toBe(true);
+	it("forbids classifying continue/health/self-test follow-ups as TRIVIAL", () => {
+		const prompt = buildTriagePrompt({ promptText: "have you finalized yet?" });
+		expect(prompt).toMatch(/Never classify as TRIVIAL/);
+		expect(prompt).toMatch(/health or stress tests/);
+	});
+});
+
+describe("floorTriageTier / isDiscoveryAuditGoal / resolveVerifierCwd", () => {
+	it("floors continue and health-audit prompts off TRIVIAL", () => {
+		expect(
+			floorTriageTier({
+				promptText: "have you finalized yet?",
+				classified: "trivial",
+				goalActive: false,
+			}),
+		).toBe("standard");
+		expect(
+			floorTriageTier({
+				promptText: "aggressively stress testing yourself and watching your logs",
+				classified: "trivial",
+				goalActive: false,
+			}),
+		).toBe("standard");
+		expect(isDiscoveryAuditGoal("investigate logs and report health concerns")).toBe(true);
+	});
+
+	it("keeps thanks and hi as TRIVIAL even when a goal is active", () => {
+		expect(
+			floorTriageTier({ promptText: "thanks", classified: "trivial", goalActive: true, lastOutcome: "verified" }),
+		).toBe("trivial");
+		expect(floorTriageTier({ promptText: "Hi Pi", classified: "trivial", goalActive: false })).toBe("trivial");
+	});
+
+	it("does not walk verifier cwd to a non-project directory", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-no-pkg-"));
+		try {
+			expect(resolveVerifierCwd(dir)).toBeNull();
+			writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "here" }));
+			expect(resolveVerifierCwd(dir)).toBe(dir);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("tallyMakerTrace", () => {
+	it("counts unique tool results and assistant turns from the full trace", () => {
+		const a1 = assistant("one");
+		const a2 = assistant("two");
+		const t1 = toolResult("bash", "ok");
+		const t2 = toolResult("read", "ok");
+		const msgs: AgentMessage[] = [{ role: "user", content: "do work", timestamp: Date.now() }, a1, t1, a2, t2];
+		const first = tallyMakerTrace(msgs.slice(0, 3), a1);
+		const second = tallyMakerTrace(msgs, a2);
+		expect(first.toolCalls).toBe(1);
+		expect(first.makerTurns).toBe(1);
+		expect(second.toolCalls).toBe(2);
+		expect(second.makerTurns).toBe(2);
 	});
 });
 
@@ -228,6 +416,7 @@ describe("createVerifyRouting", () => {
 			["openrouter/anthropic/claude-opus-5", modelWithId("anthropic/claude-opus-5")],
 			["openrouter/z-ai/glm-5.2", modelWithId("z-ai/glm-5.2")],
 			["openrouter/moonshotai/kimi-k3", modelWithId("moonshotai/kimi-k3")],
+			["openrouter/meta/muse-spark-1.2", modelWithId("meta/muse-spark-1.2")],
 		]);
 		const resolveModel = (ref: string | undefined) => {
 			if (!ref) return undefined;
@@ -239,6 +428,7 @@ describe("createVerifyRouting", () => {
 			"anthropic/claude-opus-5": ["1. inspect\n2. implement\n3. test"],
 			"z-ai/glm-5.2": [],
 			"moonshotai/kimi-k3": [],
+			"meta/muse-spark-1.2": [],
 		};
 		const routing = createVerifyRouting({
 			verify: {
@@ -332,22 +522,49 @@ describe("createVerifyRouting", () => {
 		expect(calls).toEqual([]);
 	});
 
-	it("skips planFirst for short conversational prompts (heuristic trivial tier)", async () => {
-		const { routing, calls, runModel, auditLogPath } = setup();
+	it("lets triage classify a greeting so the planner never runs", async () => {
+		const { routing, calls, replies, runModel, auditLogPath } = setup({
+			triage: { enabled: true },
+			planFirst: true,
+		});
+		replies["deepseek/deepseek-v4-flash-0731"] = ["TRIVIAL"];
 		const prep = await routing.beforeFirstTurn({
 			context: { systemPrompt: "", messages: [], tools: [] },
-			newMessages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+			newMessages: [{ role: "user", content: "Hi Pi", timestamp: Date.now() }],
 			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
 			runModel,
 		} as unknown as BeforeFirstTurnContext);
-		// No planner or triage call runs, but the trivial tier still routes the maker.
 		expect(prep?.messages).toBeUndefined();
-		expect(prep?.model?.id).toBe("deepseek/deepseek-v4-flash-0731");
-		expect(prep?.thinkingLevel).toBe("medium");
-		expect(calls).toEqual([]);
+		expect(calls).toEqual(["deepseek/deepseek-v4-flash-0731"]);
 		const audit = readAudit(auditLogPath);
-		expect(audit.some((e) => e.event === "triage" && e.tier === "trivial" && e.via === "heuristic")).toBe(true);
+		expect(audit.some((e) => e.event === "triage" && e.tier === "trivial" && e.via === "heuristic")).toBe(false);
+		expect(audit.some((e) => e.event === "triage" && e.tier === "trivial")).toBe(true);
 		expect(audit.some((e) => e.event === "plan-skipped" && e.reason === "trivial-tier")).toBe(true);
+	});
+
+	it("floors a health-audit follow-up that triage mislabels TRIVIAL", async () => {
+		const { routing, replies, runModel, auditLogPath } = setup({
+			triage: { enabled: true },
+			planFirst: true,
+		});
+		replies["deepseek/deepseek-v4-flash-0731"] = ["TRIVIAL"];
+		replies["anthropic/claude-opus-5"] = ["1. read the logs\n2. report findings"];
+		await routing.beforeFirstTurn({
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [
+				{
+					role: "user",
+					content: "have you finalized yet? Also isn't this a failure that you halt without warnings?",
+					timestamp: Date.now(),
+				},
+			],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel,
+		} as unknown as BeforeFirstTurnContext);
+		const audit = readAudit(auditLogPath);
+		expect(audit.some((e) => e.event === "triage-floored" && e.from === "trivial" && e.to === "standard")).toBe(true);
+		expect(audit.some((e) => e.event === "triage" && e.tier === "standard")).toBe(true);
+		expect(audit.some((e) => e.event === "plan-skipped" && e.reason === "trivial-tier")).toBe(false);
 	});
 
 	it("schedules checkpoints every N tool turns up to max", () => {
@@ -403,6 +620,88 @@ describe("createVerifyRouting", () => {
 		}
 	});
 
+	it("does not reroute a VERIFIED-first final answer whose rationale mentions the rejection token (F-05)", async () => {
+		const { routing, calls, replies, runModel, auditLogPath } = setup({ planFirst: false });
+		// Verbatim shape of the false rejection recorded on 2026-08-13.
+		replies["moonshotai/kimi-k3"] = [
+			"VERIFIED\n\nThe receipts substantiate the final answer's checkable claims:\n" +
+				"- the report exists and tests ran\n\nNo grounds for CONFLICT were found.",
+		];
+		const verified = await routing.verifyTurn({
+			kind: "final",
+			message: assistant("done"),
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [
+				{ role: "user", content: "Build add() with tests.", timestamp: Date.now() },
+				toolResult("bash", "npm test ok"),
+			],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel,
+		} as unknown as VerifyTurnContext);
+
+		// Accepted, and the run ends on the base maker: no retry, no escalation.
+		expect(verified?.status).toBe("verified");
+		if (verified?.status === "verified") {
+			expect(verified.model?.id).toBe("deepseek/deepseek-v4-flash-0731");
+		}
+		// Exactly one checker call: no re-ask, no corrective maker cycle.
+		expect(calls).toEqual(["moonshotai/kimi-k3"]);
+
+		const audit = readAudit(auditLogPath);
+		const auditEvent = audit.find((e) => e.event === "audit");
+		expect(auditEvent?.verdict).toBe("verified");
+		expect(auditEvent?.verdictVia).toBe("bare-token-line");
+		expect(audit.some((e) => e.event === "rejected")).toBe(false);
+		expect(audit.find((e) => e.event === "run-summary")?.outcome).toBe("verified");
+	});
+
+	it("still rejects and escalates on a genuine leading CONFLICT verdict", async () => {
+		const { routing, replies, runModel, auditLogPath } = setup({ planFirst: false, planAfterRejections: 99 });
+		replies["moonshotai/kimi-k3"] = ["VERDICT: CONFLICT\n\nNo tests ran; the claim is unsupported."];
+		const rejected = await routing.verifyTurn({
+			kind: "final",
+			message: assistant("done"),
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [
+				{ role: "user", content: "Build add() with tests.", timestamp: Date.now() },
+				toolResult("bash", "ls only"),
+			],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel,
+		} as unknown as VerifyTurnContext);
+
+		expect(rejected?.status).toBe("rejected");
+		if (rejected?.status === "rejected") {
+			expect(rejected.model?.id).toBe("openai/gpt-5.6-luna");
+			expect(rejected.correctivePrompt).toContain("No tests ran");
+		}
+		const audit = readAudit(auditLogPath);
+		expect(audit.find((e) => e.event === "audit")?.verdictVia).toBe("verdict-line");
+		expect(audit.some((e) => e.event === "rejected")).toBe(true);
+	});
+
+	it("instructs checkers to emit an isolated verdict line", async () => {
+		const { routing, replies, runModel } = setup({ planFirst: false });
+		const seenPrompts: string[] = [];
+		const recordingRunModel = async (model: Model<any>, msgs: AgentMessage[]) => {
+			seenPrompts.push(msgs.map((m) => messageText(m as any)).join("\n"));
+			return runModel(model, msgs);
+		};
+		replies["moonshotai/kimi-k3"] = ["VERDICT: VERIFIED"];
+		await routing.verifyTurn({
+			kind: "final",
+			message: assistant("done"),
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [
+				{ role: "user", content: "Build add() with tests.", timestamp: Date.now() },
+				toolResult("bash", "npm test ok"),
+			],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel: recordingRunModel,
+		} as unknown as VerifyTurnContext);
+		expect(seenPrompts.join("\n")).toContain(CHECKER_VERDICT_LINE_INSTRUCTION);
+	});
+
 	it("uses kimi for final audits", async () => {
 		const { routing, calls, replies, runModel } = setup({ planFirst: false });
 		replies["moonshotai/kimi-k3"] = ["All good. VERIFIED"];
@@ -422,19 +721,20 @@ describe("createVerifyRouting", () => {
 	});
 
 	it("skips final audit for trivial tier when auditOnlyAfterTools and no tool results", async () => {
-		const { routing, calls, runModel, auditLogPath } = setup();
-		// Route the run into the trivial tier via the conversational heuristic.
+		const { routing, calls, replies, runModel, auditLogPath } = setup({ triage: { enabled: true } });
+		replies["deepseek/deepseek-v4-flash-0731"] = ["TRIVIAL"];
 		await routing.beforeFirstTurn({
 			context: { systemPrompt: "", messages: [], tools: [] },
-			newMessages: [{ role: "user", content: "ok", timestamp: Date.now() }],
+			newMessages: [{ role: "user", content: "Hi Pi", timestamp: Date.now() }],
 			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
 			runModel,
 		} as unknown as BeforeFirstTurnContext);
+		calls.length = 0;
 		const result = await routing.verifyTurn({
 			kind: "final",
 			message: assistant("hello"),
 			context: { systemPrompt: "", messages: [], tools: [] },
-			newMessages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+			newMessages: [{ role: "user", content: "Hi Pi", timestamp: Date.now() }],
 			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
 			runModel,
 		} as unknown as VerifyTurnContext);
@@ -510,8 +810,15 @@ describe("createVerifyRouting", () => {
 			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
 			runModel,
 		} as unknown as VerifyTurnContext);
-		expect(result).toBeUndefined();
+		// F-03: ambiguous verdict now surfaces an explicit UNVERIFIED notice
+		// instead of returning undefined (silent fail-open). The user must see
+		// that the checker never signed off. P1-3: distinct unverified status.
+		expect(result?.status).toBe("unverified");
+		if (result?.status === "unverified") {
+			expect(result.notice).toMatch(/UNVERIFIED.*ambiguous or unavailable/);
+		}
 		expect(readAudit(auditLogPath).some((e) => e.reason === "ambiguous-verdict")).toBe(true);
+		expect(readAudit(auditLogPath).some((e) => e.event === "run-summary" && e.outcome === "unverified")).toBe(true);
 	});
 
 	it("logs budget-exhausted and accepts final answer after max conflicts", async () => {
@@ -532,10 +839,13 @@ describe("createVerifyRouting", () => {
 			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
 			runModel,
 		};
+		// With maxRejections: 1, the first conflict is a rejection (1 > 1 = false),
+		// the second conflict exhausts (2 > 1 = true).
+		// P1-3: budget exhaustion returns unverified status, not verified.
 		expect((await routing.verifyTurn(base as unknown as VerifyTurnContext))?.status).toBe("rejected");
 		const accepted = await routing.verifyTurn(base as unknown as VerifyTurnContext);
-		expect(accepted?.status).toBe("verified");
-		if (accepted?.status === "verified") {
+		expect(accepted?.status).toBe("unverified");
+		if (accepted?.status === "unverified") {
 			expect(accepted.model?.id).toBe("deepseek/deepseek-v4-flash-0731");
 			expect(accepted.notice).toContain("[VERIFY] UNVERIFIED");
 			expect(accepted.notice).toContain("still bad");
@@ -670,6 +980,10 @@ describe("createVerifyRouting", () => {
 		} as unknown as BeforeFirstTurnContext);
 		const injected = (prep?.messages?.[0] && messageText(prep.messages[0] as any)) ?? "";
 		// Relayed questions are hard-capped even when the planner misbehaves.
+		// A character budget is not the contract — the maker must see at most 5
+		// numbered questions, not a 2000-character slice of a 40-question dump.
+		const numbered = (injected.match(/^\s*\d+[.)]\s+/gm) ?? []).length;
+		expect(numbered).toBeLessThanOrEqual(5);
 		expect(injected.length).toBeLessThan(2_600);
 		// The planner instruction itself demands plan-by-default and forbids discoverable questions.
 		const plannerPrompt = seenPrompts.join("\n");
@@ -852,8 +1166,15 @@ describe("createVerifyRouting", () => {
 			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
 			runModel: alwaysErr,
 		} as unknown as VerifyTurnContext);
-		expect(result).toBeUndefined();
+		// F-03: checker + fallback both unavailable now surfaces an explicit
+		// UNVERIFIED notice instead of returning undefined (silent fail-open).
+		// P1-3: distinct unverified status, not verified-with-notice.
+		expect(result?.status).toBe("unverified");
+		if (result?.status === "unverified") {
+			expect(result.notice).toMatch(/UNVERIFIED.*ambiguous or unavailable/);
+		}
 		expect(readAudit(auditLogPath).some((e) => e.reason === "ambiguous-verdict")).toBe(true);
+		expect(readAudit(auditLogPath).some((e) => e.event === "run-summary" && e.outcome === "unverified")).toBe(true);
 	});
 
 	it("onTurnError swaps a rate-limited maker to the fallback, capped per run", async () => {
@@ -885,6 +1206,65 @@ describe("createVerifyRouting", () => {
 		expect(readAudit(auditLogPath).filter((e) => e.event === "maker-fallback").length).toBe(2);
 	});
 
+	it("uses the spare checker when a maker-fallback collides with the checker family", async () => {
+		const { routing, replies, runModel, auditLogPath } = setup({
+			planFirst: false,
+			checkerModel: "openrouter/openai/gpt-5.6-luna",
+			checkerFallbackModel: "openrouter/meta/muse-spark-1.2",
+			checkerFallbackThinkingLevel: "xhigh",
+			makerFallbackModel: "openrouter/openai/gpt-5.6-luna",
+			checkpointCheckerModel: "openrouter/openai/gpt-5.6-luna",
+		});
+		replies["meta/muse-spark-1.2"] = ["All good. VERIFIED"];
+		const errored = assistant("", "deepseek/deepseek-v4-flash-0731");
+		(errored as { stopReason: string }).stopReason = "error";
+		(errored as { errorMessage?: string }).errorMessage = "temporarily rate-limited upstream";
+		await routing.onTurnError({
+			message: errored,
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [],
+		} as unknown as Parameters<typeof routing.onTurnError>[0]);
+
+		const thinkingByModel: Record<string, string | undefined> = {};
+		const recordingRunModel = async (model: Model<any>, msgs: AgentMessage[], opts?: { thinkingLevel?: string }) => {
+			thinkingByModel[model.id] = opts?.thinkingLevel;
+			return runModel(model, msgs);
+		};
+		const verified = await routing.verifyTurn({
+			kind: "final",
+			message: assistant("done", "openai/gpt-5.6-luna"),
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [
+				{ role: "user", content: "Build add() with tests.", timestamp: Date.now() },
+				toolResult("bash", "ok"),
+			],
+			config: { model: modelWithId("openai/gpt-5.6-luna"), convertToLlm: () => [] },
+			runModel: recordingRunModel,
+		} as unknown as VerifyTurnContext);
+		expect(verified?.status).toBe("verified");
+		const audit = readAudit(auditLogPath);
+		expect(audit.some((e) => e.event === "checker-swap" && String(e.to).includes("muse-spark"))).toBe(true);
+		expect(thinkingByModel["meta/muse-spark-1.2"]).toBe("xhigh");
+		expect(thinkingByModel["openai/gpt-5.6-luna"]).toBeUndefined();
+	});
+
+	it("installs when the session maker matches the checker if an independent spare exists", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-verify-"));
+		dirs.push(dir);
+		const routing = createVerifyRouting({
+			verify: {
+				checkerModel: "openrouter/openai/gpt-5.6-luna",
+				checkerFallbackModel: "openrouter/meta/muse-spark-1.2",
+			},
+			makerModel: modelWithId("openai/gpt-5.6-luna"),
+			makerThinkingLevel: "max",
+			cwd: dir,
+			auditLogPath: join(dir, "a.jsonl"),
+			resolveModel: (ref) => (ref ? modelWithId(ref.replace(/^openrouter\//, "")) : undefined),
+		});
+		expect(routing).toBeTruthy();
+	});
+
 	it("returns undefined when checker model cannot be resolved", () => {
 		const dir = mkdtempSync(join(tmpdir(), "pi-verify-"));
 		dirs.push(dir);
@@ -897,5 +1277,519 @@ describe("createVerifyRouting", () => {
 			resolveModel: () => undefined,
 		});
 		expect(routing).toBeUndefined();
+	});
+
+	it("F-01: stops with STOPPED_UNVERIFIED when maxMakerTurns is reached", async () => {
+		const { routing, replies, runModel, auditLogPath } = setup({
+			planFirst: false,
+			maxMakerTurns: 2,
+			maxRejections: 99, // don't let rejection budget fire first
+		});
+		replies["moonshotai/kimi-k3"] = ["VERDICT: VERIFIED"];
+		replies["z-ai/glm-5.2"] = ["VERDICT: VERIFIED"];
+		const user = { role: "user" as const, content: "do work", timestamp: Date.now() };
+		const a1 = assistant("turn 1");
+		const a2 = assistant("turn 2");
+		const t1 = toolResult("bash", "ok");
+		const first = await routing.verifyTurn({
+			kind: "checkpoint",
+			toolTurnCount: 1,
+			message: a1,
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [user, a1, t1],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel,
+		} as unknown as VerifyTurnContext);
+		expect(first?.status).toBe("verified");
+		if (first?.status === "verified") {
+			expect(first.notice).toBeUndefined();
+		}
+		const second = await routing.verifyTurn({
+			kind: "final",
+			message: a2,
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [user, a1, t1, a2],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel,
+		} as unknown as VerifyTurnContext);
+		expect(second?.status).toBe("unverified");
+		if (second?.status === "unverified") {
+			expect(second.notice).toMatch(/STOPPED_UNVERIFIED.*max-maker-turns/);
+		}
+		expect(
+			readAudit(auditLogPath).some((e) => e.event === "run-stopped" && e.reason?.includes("max-maker-turns")),
+		).toBe(true);
+		expect(readAudit(auditLogPath).some((e) => e.event === "run-summary" && e.outcome === "stopped")).toBe(true);
+	});
+
+	it("does not double-count cumulative tool results across checkpoints", async () => {
+		const { routing, replies, runModel } = setup({
+			planFirst: false,
+			maxToolCallsPerRun: 10,
+			maxRejections: 99,
+		});
+		replies["z-ai/glm-5.2"] = ["VERDICT: VERIFIED", "VERDICT: VERIFIED", "VERDICT: VERIFIED", "VERDICT: VERIFIED"];
+		const user = { role: "user" as const, content: "do work", timestamp: Date.now() };
+		const tools = [toolResult("a", "1"), toolResult("b", "2"), toolResult("c", "3"), toolResult("d", "4")];
+		const msgs: AgentMessage[] = [user];
+		for (let i = 0; i < 4; i++) {
+			const turn = assistant(`t${i}`);
+			msgs.push(turn, tools[i]);
+			const result = await routing.verifyTurn({
+				kind: "checkpoint",
+				toolTurnCount: i + 1,
+				message: turn,
+				context: { systemPrompt: "", messages: [], tools: [] },
+				newMessages: [...msgs],
+				config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+				runModel,
+			} as unknown as VerifyTurnContext);
+			expect(result?.status).toBe("verified");
+		}
+	});
+
+	it("sums maker cost from the whole trace, not only the last checkpoint message", async () => {
+		const { routing, replies, runModel } = setup({
+			planFirst: false,
+			maxRunCostUsd: 2.5,
+			maxRejections: 99,
+		});
+		replies["moonshotai/kimi-k3"] = ["VERDICT: VERIFIED"];
+		const paid = (text: string, cost: number) =>
+			assistant(text, "mock", {
+				usage: {
+					input: 10,
+					output: 10,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 20,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost },
+				},
+			});
+		const user = { role: "user" as const, content: "do work", timestamp: Date.now() };
+		const a1 = paid("one", 1);
+		const a2 = paid("two", 1);
+		const a3 = paid("three", 1);
+		const result = await routing.verifyTurn({
+			kind: "final",
+			message: a3,
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [user, a1, a2, a3],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel,
+		} as unknown as VerifyTurnContext);
+		expect(result?.status).toBe("unverified");
+		if (result?.status === "unverified") {
+			expect(result.notice).toMatch(/STOPPED_UNVERIFIED.*max-run-cost/);
+		}
+	});
+
+	it("shouldStopAfterTurn stops between checkpoints when the tool budget is spent", async () => {
+		const { routing } = setup({ planFirst: false, maxToolCallsPerRun: 2 });
+		const user = { role: "user" as const, content: "do work", timestamp: Date.now() };
+		const a1 = assistant("working");
+		const newMessages: AgentMessage[] = [user, a1, toolResult("a", "1"), toolResult("b", "2")];
+		const context = { systemPrompt: "", messages: [...newMessages], tools: [] };
+		const stop = routing.shouldStopAfterTurn({
+			message: a1,
+			toolResults: [],
+			context,
+			newMessages,
+		});
+		expect(stop).toBe(true);
+		expect(newMessages.some((m) => m.role === "user" && messageText(m).includes("STOPPED_UNVERIFIED"))).toBe(true);
+	});
+
+	it("F-07: every audit event carries a runId and schema=2 envelope", async () => {
+		const { routing, replies, runModel, auditLogPath } = setup({ planFirst: false });
+		replies["moonshotai/kimi-k3"] = ["VERDICT: VERIFIED"];
+		await routing.verifyTurn({
+			kind: "final",
+			message: assistant("done"),
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [{ role: "user", content: "do work", timestamp: Date.now() }, toolResult("bash", "ok")],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel,
+		} as unknown as VerifyTurnContext);
+		const events = readAudit(auditLogPath);
+		// run-start, audit, demoted, run-summary — all should carry runId + schema.
+		for (const e of events) {
+			expect(typeof e.runId).toBe("string");
+			expect(e.runId.length).toBeGreaterThan(0);
+			expect(e.schema).toBe(2);
+		}
+		// All events in one run share the same runId.
+		const ids = new Set(events.map((e) => e.runId));
+		expect(ids.size).toBe(1);
+	});
+
+	it("P0-2: yes after a finished standard run stays non-trivial", async () => {
+		const { routing, replies, runModel, auditLogPath } = setup({
+			planFirst: false,
+			triage: { enabled: true },
+		});
+		// First prompt: a real task that gets triaged as standard.
+		replies["deepseek/deepseek-v4-flash-0731"] = ["STANDARD"];
+		const realCtx = {
+			context: {
+				systemPrompt: "",
+				messages: [],
+				tools: [],
+			},
+			newMessages: [{ role: "user", content: "Build add() with tests.", timestamp: Date.now() }],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel,
+		} as unknown as BeforeFirstTurnContext;
+		await routing.beforeFirstTurn(realCtx);
+		const realAudit = readAudit(auditLogPath);
+		expect(realAudit.some((e) => e.event === "triage" && e.tier === "standard")).toBe(true);
+
+		// The real CLARIFY path finishes a no-tool standard turn and emits a
+		// run-summary. A test that never calls verifyTurn cannot catch the
+		// goalActive wipe inside emitRunSummary.
+		replies["moonshotai/kimi-k3"] = ["VERDICT: VERIFIED"];
+		await routing.verifyTurn({
+			kind: "final",
+			message: assistant("I asked the user two questions and stopped."),
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [{ role: "user", content: "Build add() with tests.", timestamp: Date.now() }],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel,
+		} as unknown as VerifyTurnContext);
+		expect(readAudit(auditLogPath).some((e) => e.event === "run-summary")).toBe(true);
+
+		replies["deepseek/deepseek-v4-flash-0731"] = ["STANDARD"];
+		const yesCtx = {
+			context: {
+				systemPrompt: "",
+				messages: [],
+				tools: [],
+			},
+			newMessages: [{ role: "user", content: "yes", timestamp: Date.now() }],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel,
+		} as unknown as BeforeFirstTurnContext;
+		await routing.beforeFirstTurn(yesCtx);
+		const yesTriage = readAudit(auditLogPath).filter((e) => e.event === "triage");
+		const last = yesTriage[yesTriage.length - 1];
+		expect(last?.via).not.toBe("heuristic");
+		expect(last?.tier).not.toBe("trivial");
+	});
+});
+
+describe("boundContextForModel", () => {
+	const smallModel = { ...modelWithId("test/small"), contextWindow: 10_000 };
+	const largeModel = { ...modelWithId("test/large"), contextWindow: 1_000_000 };
+
+	it("returns messages unchanged when they fit the model context window", () => {
+		const msgs: AgentMessage[] = [
+			{ role: "user", content: "Build add() with tests.", timestamp: Date.now() },
+			{ role: "assistant", content: [{ type: "text", text: "done" }], timestamp: Date.now() } as AgentMessage,
+		];
+		expect(boundContextForModel(msgs, largeModel)).toBe(msgs);
+	});
+
+	it("truncates from the front when over budget, keeping the goal + most recent", () => {
+		const goal: AgentMessage = { role: "user", content: "Build the app.", timestamp: Date.now() };
+		const msgs: AgentMessage[] = [goal];
+		for (let i = 0; i < 200; i++) {
+			msgs.push({
+				role: i % 2 === 0 ? "assistant" : "user",
+				content: [{ type: "text", text: "x".repeat(500) }],
+				timestamp: Date.now(),
+			} as AgentMessage);
+		}
+		const bounded = boundContextForModel(msgs, smallModel);
+		expect(bounded[0]).toBe(goal);
+		expect(bounded.length).toBeLessThan(20);
+		expect(bounded.length).toBeGreaterThan(1);
+		expect(bounded[bounded.length - 1]).toBe(msgs[msgs.length - 1]);
+	});
+
+	it("returns just the goal when even that barely fits", () => {
+		const tinyModel = { ...modelWithId("test/tiny"), contextWindow: 8200 };
+		const goal: AgentMessage = { role: "user", content: "Build the app.", timestamp: Date.now() };
+		const msgs: AgentMessage[] = [
+			goal,
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "x".repeat(100_000) }],
+				timestamp: Date.now(),
+			} as AgentMessage,
+		];
+		const bounded = boundContextForModel(msgs, tinyModel);
+		expect(bounded.length).toBe(1);
+		expect(bounded[0]).toBe(goal);
+	});
+
+	it("returns a truncated goal when the window is smaller than the response reserve", () => {
+		const tinyModel = { ...modelWithId("test/tiny"), contextWindow: 1_000 };
+		const goal: AgentMessage = {
+			role: "user",
+			content: "Build the app with a full test suite.",
+			timestamp: Date.now(),
+		};
+		const msgs: AgentMessage[] = [
+			goal,
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "x".repeat(50_000) }],
+				timestamp: Date.now(),
+			} as AgentMessage,
+		];
+		const bounded = boundContextForModel(msgs, tinyModel);
+		expect(bounded.length).toBe(1);
+		expect(messageText(bounded[0] as AgentMessage)).toMatch(/TRUNCATED/i);
+		expect(messageText(bounded[0] as AgentMessage)).not.toContain("x".repeat(100));
+	});
+
+	it("handles messages with no user goal (keeps only recent)", () => {
+		const msgs: AgentMessage[] = [];
+		for (let i = 0; i < 100; i++) {
+			msgs.push({
+				role: "assistant",
+				content: [{ type: "text", text: "x".repeat(500) }],
+				timestamp: Date.now(),
+			} as AgentMessage);
+		}
+		const bounded = boundContextForModel(msgs, smallModel);
+		expect(bounded.length).toBeLessThan(20);
+		expect(bounded.length).toBeGreaterThan(0);
+	});
+
+	it("returns an empty array for an empty input", () => {
+		expect(boundContextForModel([], smallModel)).toEqual([]);
+	});
+});
+
+describe("redactEvidence", () => {
+	it("redacts OpenRouter, OpenAI, GitHub, and xAI API keys", () => {
+		const keys = [
+			`sk-or-v1-${"a".repeat(64)}`,
+			`sk-${"b".repeat(48)}`,
+			`ghp_${"A".repeat(36)}`,
+			`xai-${"c".repeat(48)}`,
+		];
+		for (const key of keys) {
+			const redacted = redactEvidence(key);
+			expect(redacted).not.toContain(key);
+			expect(redacted).toMatch(/REDACTED/i);
+		}
+	});
+
+	it("preserves git SHA-1 (40 hex) and SHA-256 (64 hex) commit hashes", () => {
+		const sha1 = "a1b2c3d4e5f6789012345678901234567890abcd";
+		const sha256 = "a".repeat(64);
+		expect(sha1.length).toBe(40);
+		expect(sha256.length).toBe(64);
+		expect(redactEvidence(`commit ${sha1} updated`)).toContain(sha1);
+		expect(redactEvidence(`commit ${sha256} updated`)).toContain(sha256);
+	});
+
+	it("redacts non-hex 40+ char tokens", () => {
+		const token = "X".repeat(40);
+		expect(redactEvidence(`value: ${token}`)).not.toContain(token);
+	});
+
+	it("captures the key name for key=value format (no literal $1)", () => {
+		const redacted = redactEvidence(`api_key=${"A".repeat(40)}`);
+		expect(redacted).not.toContain("$1");
+		expect(redacted).not.toContain("A".repeat(32));
+		expect(redacted).toMatch(/api_key=\[REDACTED\]/i);
+	});
+
+	it("redacts key:value format with a colon separator", () => {
+		const redacted = redactEvidence(`api_key: ${"A".repeat(40)}`);
+		expect(redacted).not.toContain("A".repeat(32));
+		expect(redacted).toMatch(/api_key=\[REDACTED\]/i);
+	});
+
+	it("does not redact short values in key=value format", () => {
+		expect(redactEvidence("api_key: enable")).toContain("enable");
+		expect(redactEvidence("auth: bearer")).toContain("bearer");
+	});
+
+	it("redacts .env-style lines with sensitive key names", () => {
+		const redacted = redactEvidence(`MY_API_KEY=sk_test_${"x".repeat(40)}`);
+		expect(redacted).not.toContain("sk_test_");
+		expect(redacted).toMatch(/MY_API_KEY=\[REDACTED\]/i);
+	});
+
+	it("redacts AWS access keys", () => {
+		const aws = "AKIA" + "ABCDEFGHJKLMNPQRS";
+		expect(redactEvidence(aws)).not.toContain(aws);
+		expect(redactEvidence(aws)).toMatch(/REDACTED/i);
+	});
+});
+
+describe("readUntrackedFile", () => {
+	const dirs: string[] = [];
+	afterEach(() => {
+		for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+	});
+
+	function gitRepo(): string {
+		const dir = mkdtempSync(join(tmpdir(), "pi-untracked-"));
+		dirs.push(dir);
+		execSync("git init", { cwd: dir, stdio: "ignore" });
+		execSync('git config user.email "eval@test"', { cwd: dir, stdio: "ignore" });
+		execSync('git config user.name "eval"', { cwd: dir, stdio: "ignore" });
+		writeFileSync(join(dir, "tracked.txt"), "old\n");
+		execSync("git add tracked.txt && git commit --no-gpg-sign -m init", { cwd: dir, stdio: "ignore" });
+		return dir;
+	}
+
+	it("reads a regular untracked file", () => {
+		const dir = gitRepo();
+		writeFileSync(join(dir, "new.ts"), "export const n = 1;\n");
+		expect(readUntrackedFile(dir, "new.ts")).toContain("export const n = 1");
+	});
+
+	it("does not follow a symlink out of the workspace", () => {
+		const dir = gitRepo();
+		const outside = mkdtempSync(join(tmpdir(), "pi-outside-"));
+		dirs.push(outside);
+		writeFileSync(join(outside, "secret.txt"), "outside-secret\n");
+		symlinkSync(join(outside, "secret.txt"), join(dir, "link.txt"));
+		expect(readUntrackedFile(dir, "link.txt")).toBe("");
+	});
+
+	it("follows an in-workspace symlink to a regular file", () => {
+		const dir = gitRepo();
+		writeFileSync(join(dir, "target.ts"), "export const inside = true;\n");
+		symlinkSync(join(dir, "target.ts"), join(dir, "alias.ts"));
+		expect(readUntrackedFile(dir, "alias.ts")).toContain("export const inside = true");
+	});
+
+	it("reads a nested untracked file whose path has intermediate directories", () => {
+		const dir = gitRepo();
+		mkdirSync(join(dir, "sub"));
+		writeFileSync(join(dir, "sub", "nested.ts"), "export const nested = 1;\n");
+		expect(readUntrackedFile(dir, "sub/nested.ts")).toContain("export const nested = 1");
+	});
+
+	it("skips FIFOs instead of blocking on an unbounded read", () => {
+		if (process.platform === "win32") return;
+		const dir = gitRepo();
+		execSync("mkfifo pipe.fifo", { cwd: dir, stdio: "ignore" });
+		expect(readUntrackedFile(dir, "pipe.fifo")).toBe("");
+		const evidence = gatherDiffEvidence(dir, "final");
+		expect(evidence).not.toMatch(/outside-secret|blocked-on-fifo/);
+	});
+
+	it("does not load oversized regular files into checker evidence", () => {
+		const dir = gitRepo();
+		const huge = Buffer.alloc(UNTRACKED_FILE_MAX_BYTES + 1, 0x61);
+		writeFileSync(join(dir, "huge.txt"), huge);
+		const body = readUntrackedFile(dir, "huge.txt");
+		expect(body).toMatch(/\[\.\.\. \d+ more chars \.\.\.\]/);
+		expect(body).not.toContain("aaa");
+	});
+
+	it("skips directories instead of reading them as files", () => {
+		const dir = gitRepo();
+		mkdirSync(join(dir, "nested"));
+		writeFileSync(join(dir, "nested", "inside.ts"), "export const hidden = 1;\n");
+		expect(readUntrackedFile(dir, "nested")).toBe("");
+	});
+
+	it("still shows a goal untracked file when 40 other untracked names sort first", () => {
+		const dir = gitRepo();
+		for (let i = 0; i < 40; i++) {
+			writeFileSync(join(dir, `aaa-${String(i).padStart(2, "0")}.txt`), "noise\n");
+		}
+		writeFileSync(join(dir, "zzz-goal.ts"), "export const goal = 1;\n");
+		const evidence = gatherDiffEvidence(dir, "final", { focusPaths: ["zzz-goal.ts"] });
+		expect(evidence).toContain("export const goal = 1");
+		expect(evidence).toContain(GOAL_DIFF_TRUNCATION_MARKER);
+		expect(evidenceTruncationBlocksVerified(evidence)).toBe(true);
+	});
+
+	it("marks omitted untracked files so a silent VERIFIED is illegal", () => {
+		const dir = gitRepo();
+		for (let i = 0; i < 41; i++) {
+			writeFileSync(join(dir, `u${String(i).padStart(2, "0")}.txt`), `body-${i}\n`);
+		}
+		const evidence = gatherDiffEvidence(dir, "final");
+		expect(evidence).toContain(GOAL_DIFF_TRUNCATION_MARKER);
+		expect(evidenceTruncationBlocksVerified(evidence)).toBe(true);
+	});
+
+	it("treats bash-created untracked files as goal evidence even when another path was touched", () => {
+		const dir = gitRepo();
+		for (let i = 0; i < 20; i++) {
+			writeFileSync(join(dir, `aaa-${String(i).padStart(2, "0")}.txt`), "noise\n");
+		}
+		writeFileSync(join(dir, "zzz-via-bash.ts"), "export const viaBash = 1;\n");
+		const evidence = gatherDiffEvidence(dir, "final", { focusPaths: ["tracked.txt"] });
+		expect(evidence).toContain("export const viaBash = 1");
+		expect(evidenceTruncationBlocksVerified(evidence)).toBe(false);
+	});
+});
+
+describe("collectTouchedPaths bash mutations", () => {
+	const dirs: string[] = [];
+	afterEach(() => {
+		for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+	});
+
+	function gitRepo(): string {
+		const dir = mkdtempSync(join(tmpdir(), "pi-bash-touch-"));
+		dirs.push(dir);
+		execSync("git init", { cwd: dir, stdio: "ignore" });
+		execSync('git config user.email "eval@test"', { cwd: dir, stdio: "ignore" });
+		execSync('git config user.name "eval"', { cwd: dir, stdio: "ignore" });
+		writeFileSync(join(dir, "helper.ts"), "export const before = 1;\n");
+		writeFileSync(join(dir, "goal.ts"), "export const goal = 'old';\n");
+		writeFileSync(join(dir, "unrelated.ts"), "old-unrelated\n");
+		execSync("git add helper.ts goal.ts unrelated.ts && git commit --no-gpg-sign -m init", {
+			cwd: dir,
+			stdio: "ignore",
+		});
+		return dir;
+	}
+
+	function toolCall(name: string, args: Record<string, unknown>): AgentMessage {
+		return {
+			...assistant("", "mock"),
+			content: [{ type: "toolCall", id: `call_${name}`, name, arguments: args }],
+			stopReason: "toolUse",
+		} as AgentMessage;
+	}
+
+	it("keeps a bash-edited tracked file in goal evidence even when edit touched another path", () => {
+		const dir = gitRepo();
+		writeFileSync(join(dir, "helper.ts"), "export function hasLeadingTilde() { return true; }\n");
+		writeFileSync(join(dir, "goal.ts"), "export const goal = 'BASH_TRACKED_MARKER';\n");
+		writeFileSync(join(dir, "unrelated.ts"), `${"x".repeat(500)}\n`);
+		const focus = collectTouchedPaths(
+			[
+				toolCall("edit", { path: "helper.ts" }),
+				toolCall("bash", { command: "sed -i '' \"s/old/BASH_TRACKED_MARKER/\" goal.ts" }),
+			],
+			dir,
+		);
+		expect(focus).toEqual(expect.arrayContaining(["helper.ts", "goal.ts"]));
+		const evidence = gatherDiffEvidence(dir, "final", { focusPaths: focus });
+		expect(evidence).toContain("BASH_TRACKED_MARKER");
+		expect(evidence).toContain("git diff HEAD (files this run edited)");
+		const otherBlock = evidence.split("git diff HEAD (other working-tree files):")[1] ?? "";
+		expect(otherBlock).not.toContain("BASH_TRACKED_MARKER");
+	});
+
+	it("does not treat a test-runner bash call as dirtying unrelated tracked files", () => {
+		const dir = gitRepo();
+		writeFileSync(join(dir, "helper.ts"), "export function hasLeadingTilde() { return true; }\n");
+		writeFileSync(join(dir, "unrelated.ts"), `${"x".repeat(500)}\n`);
+		const focus = collectTouchedPaths(
+			[toolCall("edit", { path: "helper.ts" }), toolCall("bash", { command: "npx vitest run paths.test.ts" })],
+			dir,
+		);
+		expect(focus).toEqual(["helper.ts"]);
+		const evidence = gatherDiffEvidence(dir, "final", { focusPaths: focus, maxChars: 800 });
+		expect(evidence).toContain("hasLeadingTilde");
+		expect(evidence).toContain(OTHER_DIFF_TRUNCATION_MARKER);
+		expect(evidence).not.toContain(GOAL_DIFF_TRUNCATION_MARKER);
+		expect(evidenceTruncationBlocksVerified(evidence)).toBe(false);
 	});
 });

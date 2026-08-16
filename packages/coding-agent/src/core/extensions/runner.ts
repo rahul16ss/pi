@@ -747,6 +747,10 @@ export class ExtensionRunner {
 				runner.assertActive();
 				return runner.getSystemPromptFn();
 			},
+			waitForIdle: () => {
+				runner.assertActive();
+				return runner.waitForIdleFn();
+			},
 		};
 	}
 

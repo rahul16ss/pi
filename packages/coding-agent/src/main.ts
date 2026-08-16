@@ -29,6 +29,7 @@ import { resolveCredentialForPrint } from "./cli/credential-print.ts";
 import { processFileArguments } from "./cli/file-processor.ts";
 import { buildInitialMessage } from "./cli/initial-message.ts";
 import { listModels } from "./cli/list-models.ts";
+import { readPipedStdin } from "./cli/piped-stdin.ts";
 import { createProjectTrustContext } from "./cli/project-trust.ts";
 import { selectSession } from "./cli/session-picker.ts";
 import { shouldRunFirstTimeSetup, showFirstTimeSetup, showStartupSelector } from "./cli/startup-ui.ts";
@@ -68,29 +69,6 @@ import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
 import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.ts";
 
 const EXTENSION_LOAD_FAILURE_HINT = `Hint: Start without extensions using "${APP_NAME} -ne".`;
-
-/**
- * Read all content from piped stdin.
- * Returns undefined if stdin is a TTY (interactive terminal).
- */
-async function readPipedStdin(): Promise<string | undefined> {
-	// If stdin is a TTY, we're running interactively - don't read stdin
-	if (process.stdin.isTTY) {
-		return undefined;
-	}
-
-	return new Promise((resolve) => {
-		let data = "";
-		process.stdin.setEncoding("utf8");
-		process.stdin.on("data", (chunk) => {
-			data += chunk;
-		});
-		process.stdin.on("end", () => {
-			resolve(data.trim() || undefined);
-		});
-		process.stdin.resume();
-	});
-}
 
 function collectSettingsDiagnostics(
 	settingsManager: SettingsManager,
@@ -872,7 +850,11 @@ export async function main(args: string[], options?: MainOptions) {
 	// Read piped stdin content (if any) - skip for RPC mode which uses stdin for JSON-RPC
 	let stdinContent: string | undefined;
 	if (appMode !== "rpc") {
-		stdinContent = await readPipedStdin();
+		stdinContent = await readPipedStdin(process.stdin, {
+			// A CLI prompt is already on argv (`pi -p "…"`). Do not wait forever
+			// for a parent that leaves stdin open. Still pick up `echo x | pi -p`.
+			waitForEnd: parsed.messages.length === 0 && parsed.fileArgs.length === 0,
+		});
 		if (stdinContent !== undefined && appMode === "interactive") {
 			appMode = "print";
 		}

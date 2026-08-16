@@ -2,6 +2,7 @@ import { fileURLToPath } from "node:url";
 import { defineConfig, mergeConfig } from "vitest/config";
 import baseConfig, { workspaceSourcePaths } from "../../vitest.base.ts";
 
+/** Machine-local eval-gate / gauntlet tests excluded from default CI vitest. */
 export default mergeConfig(
 	baseConfig,
 	defineConfig({
@@ -9,20 +10,9 @@ export default mergeConfig(
 			globals: true,
 			environment: "node",
 			testTimeout: 30000,
-			// Tests run offline by default; opt in with allowNetwork() from test/test-network-env.ts.
 			env: { PI_OFFLINE: "1" },
 			unstubEnvs: true,
-			reporters: process.env.GITHUB_ACTIONS ? ["dot", "github-actions"] : ["dot"],
-			silent: "passed-only",
-			// gauntlet-extension.test.ts imports from ~/.pi/agent/extensions/gauntlet.ts
-			// and harness-eval-gate.test.ts has live-config tests that read
-			// ~/.pi/agent/settings.json — both only exist on the user's machine.
-			exclude: [
-				"**/gauntlet-extension.test.ts",
-				"**/harness-eval-gate.test.ts",
-				"**/node_modules/**",
-				"**/dist/**",
-			],
+			exclude: ["**/node_modules/**", "**/dist/**"],
 			server: {
 				deps: {
 					external: [/@silvia-odwyer\/photon-node/],

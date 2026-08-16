@@ -333,10 +333,17 @@ async function runLoop(
 						runModel,
 					});
 				} catch {
-					verifyResult = undefined; // honor the graceful contract
+					// P1/Gate 9: a thrown checker must not look like a clean
+					// pass. Surface an explicit UNVERIFIED notice so the user
+					// sees the checker crashed, instead of ending normally.
+					verifyResult = {
+						status: "unverified",
+						notice:
+							"[VERIFY] UNVERIFIED — the checker threw an error and could not complete its audit. Treat the answer with suspicion.",
+					};
 				}
 
-				if (verifyResult?.status === "verified") {
+				if (verifyResult?.status === "verified" || verifyResult?.status === "unverified") {
 					if (verifyResult.model) config = { ...config, model: verifyResult.model };
 					if (verifyResult.thinkingLevel !== undefined) {
 						config = {
@@ -345,6 +352,8 @@ async function runLoop(
 						};
 					}
 					if (verifyResult.notice) {
+						// P1-3: unverified notices are always present and start with
+						// [VERIFY], making them distinguishable from normal messages.
 						const noticeMessage: AgentMessage = {
 							role: "user",
 							content: verifyResult.notice,
@@ -355,7 +364,7 @@ async function runLoop(
 						currentContext.messages.push(noticeMessage);
 						newMessages.push(noticeMessage);
 					}
-					// Final verified → stop. Checkpoint verified → keep building (possibly demoted).
+					// Final verified/unverified → stop. Checkpoint verified/unverified → keep building.
 					if (verifyKind === "final") {
 						await emit({ type: "agent_end", messages: newMessages });
 						return;
@@ -394,6 +403,7 @@ async function runLoop(
 				};
 			}
 
+			const stopNoticeFrom = newMessages.length;
 			if (
 				await config.shouldStopAfterTurn?.({
 					message,
@@ -402,6 +412,10 @@ async function runLoop(
 					newMessages,
 				})
 			) {
+				for (const extra of newMessages.slice(stopNoticeFrom)) {
+					await emit({ type: "message_start", message: extra });
+					await emit({ type: "message_end", message: extra });
+				}
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
 			}
