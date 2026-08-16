@@ -8,6 +8,8 @@
   <a href="https://www.npmjs.com/package/@earendil-works/pi-coding-agent"><img alt="npm" src="https://img.shields.io/npm/v/@earendil-works/pi-coding-agent?style=flat-square" /></a>
 </p>
 
+> **This copy (`rahul16ss/pi`)** is a working fork of the public Pi agent harness with local maker/checker/planner routing (`packages/coding-agent/src/core/verify-routing.ts`). The rest of this README describes upstream Pi.
+
 > New issues and PRs from new contributors are auto-closed by default. Maintainers review auto-closed issues daily. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 # Pi Agent Harness

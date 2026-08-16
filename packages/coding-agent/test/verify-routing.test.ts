@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage, BeforeFirstTurnContext, VerifyTurnContext } from "@earendil-works/pi-agent-core";
@@ -1578,6 +1578,13 @@ describe("readUntrackedFile", () => {
 		expect(readUntrackedFile(dir, "link.txt")).toBe("");
 	});
 
+	it("follows an in-workspace symlink to a regular file", () => {
+		const dir = gitRepo();
+		writeFileSync(join(dir, "target.ts"), "export const inside = true;\n");
+		symlinkSync(join(dir, "target.ts"), join(dir, "alias.ts"));
+		expect(readUntrackedFile(dir, "alias.ts")).toContain("export const inside = true");
+	});
+
 	it("skips FIFOs instead of blocking on an unbounded read", () => {
 		if (process.platform === "win32") return;
 		const dir = gitRepo();
@@ -1594,5 +1601,12 @@ describe("readUntrackedFile", () => {
 		const body = readUntrackedFile(dir, "huge.txt");
 		expect(body).toMatch(/\[\.\.\. \d+ more chars \.\.\.\]/);
 		expect(body).not.toContain("aaa");
+	});
+
+	it("skips directories instead of reading them as files", () => {
+		const dir = gitRepo();
+		mkdirSync(join(dir, "nested"));
+		writeFileSync(join(dir, "nested", "inside.ts"), "export const hidden = 1;\n");
+		expect(readUntrackedFile(dir, "nested")).toBe("");
 	});
 });

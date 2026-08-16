@@ -13,6 +13,7 @@
 
 - Final verification now skips untracked FIFOs, sockets, and device files, and substitutes a truncation marker for regular files larger than 1 MiB, so checker evidence gathering cannot hang or grow without bound.
 - Untracked symlink targets outside the workspace are no longer forwarded to the checker.
+- Untracked reads open the resolved path with `O_NOFOLLOW`/`O_NONBLOCK` and `fstat` that descriptor before reading, so a concurrent replacement cannot swap in a symlink, FIFO, or oversized file after the path checks.
 - The gauntlet M1 metric clusters conflict records rather than characters.
 
 ## [0.84.2] - 2026-08-14

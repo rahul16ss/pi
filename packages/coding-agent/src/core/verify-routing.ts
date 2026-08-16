@@ -31,7 +31,18 @@
  */
 
 import { execFileSync, execSync } from "node:child_process";
-import { appendFileSync, lstatSync, readFileSync, realpathSync, type Stats } from "node:fs";
+import {
+	appendFileSync,
+	closeSync,
+	constants,
+	fstatSync,
+	lstatSync,
+	openSync,
+	readFileSync,
+	readSync,
+	realpathSync,
+	type Stats,
+} from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type {
 	AgentLoopTurnUpdate,
@@ -580,16 +591,43 @@ function isUnsafeUntrackedTarget(stat: Stats): boolean {
 	return stat.isFIFO() || stat.isSocket() || stat.isCharacterDevice() || stat.isBlockDevice() || stat.isDirectory();
 }
 
+function untrackedOpenFlags(): number {
+	const nofollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+	const nonblock = typeof constants.O_NONBLOCK === "number" ? constants.O_NONBLOCK : 0;
+	return constants.O_RDONLY | nofollow | nonblock;
+}
+
+/** Read from an already-opened descriptor so type/size/content cannot change under us. */
+function readOpenedUntracked(fd: number): string {
+	const opened = fstatSync(fd);
+	if (!opened.isFile() || isUnsafeUntrackedTarget(opened)) return "";
+	if (opened.size > UNTRACKED_FILE_MAX_BYTES) {
+		return `[... ${Number(opened.size)} more chars ...]\n`;
+	}
+	if (opened.size === 0) return "";
+	const buf = Buffer.alloc(Number(opened.size));
+	let offset = 0;
+	while (offset < buf.length) {
+		const n = readSync(fd, buf, offset, buf.length - offset, offset);
+		if (n === 0) break;
+		offset += n;
+	}
+	return buf.subarray(0, offset).toString("utf8");
+}
+
 /** Read an untracked file without interpolating its name into a shell command.
  * Resolves symlinks so an in-repo link targeting a file outside the repo
- * cannot leak external content to the checker. Skips FIFOs, devices, sockets,
- * and directories. Oversized regular files return a truncation marker instead
- * of being read in full. */
+ * cannot leak external content to the checker. Opens the resolved path with
+ * O_NOFOLLOW | O_NONBLOCK and reads from that descriptor after fstat, so a
+ * concurrent replacement cannot swap in a symlink, FIFO, or oversized file.
+ * Oversized regular files return a truncation marker instead of being read
+ * in full. */
 export function readUntrackedFile(cwd: string, file: string): string {
 	if (!file || file.includes("\0") || isAbsolute(file)) return "";
 	const resolved = resolve(cwd, file);
 	const rel = relative(cwd, resolved);
 	if (!rel || rel.startsWith("..") || isAbsolute(rel)) return "";
+	let fd = -1;
 	try {
 		const linkStat = lstatSync(resolved);
 		if (isUnsafeUntrackedTarget(linkStat)) return "";
@@ -598,12 +636,18 @@ export function readUntrackedFile(cwd: string, file: string): string {
 		if (!realRel || realRel.startsWith("..") || isAbsolute(realRel)) return "";
 		const targetStat = lstatSync(real);
 		if (!targetStat.isFile() || isUnsafeUntrackedTarget(targetStat)) return "";
-		if (targetStat.size > UNTRACKED_FILE_MAX_BYTES) {
-			return `[... ${Number(targetStat.size)} more chars ...]\n`;
-		}
-		return readFileSync(real, { encoding: "utf8" });
+		fd = openSync(real, untrackedOpenFlags());
+		return readOpenedUntracked(fd);
 	} catch {
 		return "";
+	} finally {
+		if (fd >= 0) {
+			try {
+				closeSync(fd);
+			} catch {
+				/* already closed or invalid */
+			}
+		}
 	}
 }
 
