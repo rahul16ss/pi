@@ -1,32 +1,44 @@
 /**
- * Unit tests for the gauntlet extension's pure logic.
+ * Unit tests for the gauntlet extension: pure scoring plus the fake-runtime
+ * macro loop (start / metrics / critic skip / persist / settle / stop).
  *
  * The macro-loop verdict parser (parseCard, decideNext, extractAmendment,
  * buildRoundPrompt, …) shipped without tests; F-14 proved untested metrics
  * ship broken. These tests lock the contracts the audit called out.
  */
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	amendmentApplyInstruction,
 	buildRoundPrompt,
+	CRITIC_DISABLE_VERIFY_JSON,
+	CRITIC_GIT_SNAPSHOT_CMD,
 	classifyAmendment,
+	createGauntletSession,
 	DEFAULT_BOUNDARY,
 	decideNext,
+	evaluateRound,
 	extractAmendment,
 	fingerprintRound,
 	type GauntletCard,
+	type GauntletHost,
 	type GauntletState,
+	handleGauntletCommand,
+	handleGauntletSettled,
+	handleGauntletTransportFailure,
 	humanEscalationHit,
 	isTransportFailure,
+	loadGauntletState,
 	type MetricResult,
 	parseCard,
 	parseFindings,
 	type RoundRecord,
+	saveGauntletState,
 	sumVerifyCostSince,
 } from "../../../../.pi/agent/extensions/gauntlet.ts";
+import { InMemorySettingsStorage, SettingsManager } from "../src/core/settings-manager.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -360,6 +372,18 @@ describe("sumVerifyCostSince / isTransportFailure / humanEscalationHit", () => {
 		expect(sumVerifyCostSince(join(dir, "missing.jsonl"), "2026-08-15T00:00:00.000Z")).toBe(0);
 	});
 
+	it("critic project settings disable verify routing via empty checkerModel", () => {
+		const storage = new InMemorySettingsStorage();
+		storage.withLock("global", () =>
+			JSON.stringify({
+				verify: { checkerModel: "openrouter/openai/gpt-5.6-luna" },
+			}),
+		);
+		storage.withLock("project", () => '{"verify":{"checkerModel":""}}');
+		const mgr = SettingsManager.fromStorage(storage);
+		expect(mgr.getVerifySettings()?.checkerModel).toBe("");
+	});
+
 	it("treats only hard stop/error as transport failure", () => {
 		expect(isTransportFailure({ role: "assistant", stopReason: "error" }).failed).toBe(true);
 		expect(isTransportFailure({ role: "assistant", stopReason: "aborted" }).failed).toBe(true);
@@ -376,6 +400,15 @@ describe("sumVerifyCostSince / isTransportFailure / humanEscalationHit", () => {
 		expect(DEFAULT_BOUNDARY.max_rounds).toBe(5);
 	});
 
+	it("escalates when a passing metric's evidence still mentions a keyword", () => {
+		expect(
+			humanEscalationHit(
+				card({ boundary: { max_rounds: 5, stop_on_repeat: 2, escalate_human: ["credentials"] } }),
+				record({ results: [{ id: "M1", pass: true, evidence: "No hardcoded credentials found" }] }),
+			),
+		).toBe("credentials");
+	});
+
 	it("returns undefined when no escalation keywords match", () => {
 		expect(
 			humanEscalationHit(card(), record({ results: [{ id: "M1", pass: false, evidence: "broken tests" }] })),
@@ -387,5 +420,248 @@ describe("sumVerifyCostSince / isTransportFailure / humanEscalationHit", () => {
 		expect(
 			humanEscalationHit(noEsc, record({ results: [{ id: "M1", pass: false, evidence: "touched secrets" }] })),
 		).toBeUndefined();
+	});
+});
+
+function writeCard(dir: string, over: Partial<GauntletCard> = {}): void {
+	mkdirSync(join(dir, ".pi", "gauntlet"), { recursive: true });
+	const body = card({
+		metrics: [
+			{ id: "M1", cmd: "npm test" },
+			{ id: "M2", critic: "review the diff" },
+		],
+		boundary: { max_rounds: 5, stop_on_repeat: 2 },
+		...over,
+	});
+	writeFileSync(
+		join(dir, ".pi", "gauntlet", "CARD.md"),
+		`# Card\n\n\`\`\`json\n${JSON.stringify(body, null, 2)}\n\`\`\`\n`,
+	);
+}
+
+function fakeHost(dir: string): {
+	host: GauntletHost;
+	notices: string[];
+	messages: string[];
+	calls: Array<{ command: string; args: string[]; cwd: string }>;
+	criticSettings: string[];
+	setCmdCode: (code: number) => void;
+	setCritic: (res: { code: number; stdout: string; stderr?: string }) => void;
+} {
+	const notices: string[] = [];
+	const messages: string[] = [];
+	const calls: Array<{ command: string; args: string[]; cwd: string }> = [];
+	const criticSettings: string[] = [];
+	let cmdCode = 0;
+	let critic = { code: 0, stdout: "NONE", stderr: "" };
+	const host: GauntletHost = {
+		exec: async (command, args, opts) => {
+			calls.push({ command, args, cwd: opts.cwd });
+			if (command === "pi") {
+				criticSettings.push(readFileSync(join(opts.cwd, ".pi", "settings.json"), "utf8"));
+				return { code: critic.code, stdout: critic.stdout, stderr: critic.stderr, killed: false };
+			}
+			if (command === "bash" && args[1] === CRITIC_GIT_SNAPSHOT_CMD) {
+				return { code: 0, stdout: " M tracked.ts\n", stderr: "", killed: false };
+			}
+			return { code: cmdCode, stdout: cmdCode === 0 ? "ok" : "fail", stderr: "", killed: false };
+		},
+		notify: (message) => notices.push(message),
+		sendUserMessage: (content) => messages.push(content),
+		waitForIdle: async () => {},
+		auditLogPath: join(dir, "audit.jsonl"),
+	};
+	return {
+		host,
+		notices,
+		messages,
+		calls,
+		criticSettings,
+		setCmdCode: (code) => {
+			cmdCode = code;
+		},
+		setCritic: (res) => {
+			critic = { stderr: "", ...res };
+		},
+	};
+}
+
+describe("gauntlet runtime loop", () => {
+	it("start without a card notifies an error and does not exec", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "gauntlet-loop-"));
+		dirs.push(dir);
+		const { host, notices, calls } = fakeHost(dir);
+		await handleGauntletCommand("start", dir, createGauntletSession(), host);
+		expect(notices.some((n) => /no gauntlet card/i.test(n))).toBe(true);
+		expect(calls).toHaveLength(0);
+		expect(loadGauntletState(dir)).toBeUndefined();
+	});
+
+	it("failing command metrics skip the critic and persist a continue round", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "gauntlet-loop-"));
+		dirs.push(dir);
+		writeCard(dir);
+		const session = createGauntletSession();
+		const { host, messages, calls, criticSettings, setCmdCode } = fakeHost(dir);
+		setCmdCode(1);
+		await handleGauntletCommand("start", dir, session, host);
+		expect(calls.some((c) => c.command === "pi")).toBe(false);
+		expect(calls.some((c) => c.args[1] === CRITIC_GIT_SNAPSHOT_CMD)).toBe(false);
+		expect(criticSettings).toHaveLength(0);
+		const saved = loadGauntletState(dir);
+		expect(saved?.active).toBe(true);
+		expect(saved?.status).toBe("running");
+		expect(saved?.round).toBe(1);
+		expect(saved?.rounds[0]?.results.find((r) => r.id === "M2")?.evidence).toMatch(
+			/skipped: command metrics failing/i,
+		);
+		expect(session.awaitingRound).toBe(true);
+		expect(messages[0]).toMatch(/LARGEST GAP/i);
+		expect(messages[0]).not.toMatch(/GAUNTLET PASSED/);
+	});
+
+	it("passing commands run the critic with verify disabled in a temp cwd", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "gauntlet-loop-"));
+		dirs.push(dir);
+		writeCard(dir);
+		const { host, notices, messages, calls, criticSettings } = fakeHost(dir);
+		await handleGauntletCommand("start", dir, createGauntletSession(), host);
+		const piCall = calls.find((c) => c.command === "pi");
+		expect(piCall?.args).toEqual(
+			expect.arrayContaining(["-p", "--no-session", "--model", "openrouter/openai/gpt-5.6-luna"]),
+		);
+		expect(piCall?.cwd).not.toBe(dir);
+		expect(piCall?.cwd).toMatch(/pi-gauntlet-critic-/);
+		expect(criticSettings).toEqual([CRITIC_DISABLE_VERIFY_JSON]);
+		expect(calls.some((c) => c.command === "bash" && c.args[1] === CRITIC_GIT_SNAPSHOT_CMD && c.cwd === dir)).toBe(
+			true,
+		);
+		const saved = loadGauntletState(dir);
+		expect(saved?.status).toBe("passed");
+		expect(saved?.active).toBe(false);
+		expect(notices.some((n) => /GAUNTLET PASSED/i.test(n))).toBe(true);
+		expect(messages[0]).toMatch(/GAUNTLET PASSED/);
+	});
+
+	it("a critic that cannot run is fail-closed, not a pass", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "gauntlet-loop-"));
+		dirs.push(dir);
+		writeCard(dir);
+		const { host, messages, setCritic } = fakeHost(dir);
+		setCritic({ code: 1, stdout: "", stderr: "model down" });
+		await handleGauntletCommand("start", dir, createGauntletSession(), host);
+		const saved = loadGauntletState(dir);
+		expect(saved?.status).toBe("running");
+		expect(saved?.rounds[0]?.results.find((r) => r.id === "M2")?.pass).toBe(false);
+		expect(saved?.rounds[0]?.results.find((r) => r.id === "M2")?.findings?.[0]).toMatch(/could not run/i);
+		expect(messages[0]).toMatch(/NOT A PASS|LARGEST GAP/i);
+		expect(messages.join("\n")).not.toMatch(/GAUNTLET PASSED/);
+	});
+
+	it("stop persists stopped-user and clears the awaiting flag", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "gauntlet-loop-"));
+		dirs.push(dir);
+		writeCard(dir);
+		const session = createGauntletSession();
+		const { host, setCmdCode, notices } = fakeHost(dir);
+		setCmdCode(1);
+		await handleGauntletCommand("start", dir, session, host);
+		expect(session.awaitingRound).toBe(true);
+		await handleGauntletCommand("stop", dir, session, host);
+		expect(session.awaitingRound).toBe(false);
+		expect(loadGauntletState(dir)?.status).toBe("stopped-user");
+		expect(notices.some((n) => /stopped by user/i.test(n))).toBe(true);
+	});
+
+	it("status with no state tells the user how to arm", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "gauntlet-loop-"));
+		dirs.push(dir);
+		const { host, notices } = fakeHost(dir);
+		await handleGauntletCommand("status", dir, createGauntletSession(), host);
+		expect(notices[0]).toMatch(/no state/i);
+	});
+
+	it("agent_settled re-enters the loop only while a round is awaiting", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "gauntlet-loop-"));
+		dirs.push(dir);
+		writeCard(dir);
+		const session = createGauntletSession();
+		const { host, calls, setCmdCode } = fakeHost(dir);
+		setCmdCode(1);
+		await handleGauntletCommand("start", dir, session, host);
+		const afterStart = calls.length;
+		await handleGauntletSettled(dir, session, host);
+		expect(loadGauntletState(dir)?.round).toBe(2);
+		expect(calls.length).toBeGreaterThan(afterStart);
+		expect(session.awaitingRound).toBe(true);
+
+		const idle = createGauntletSession();
+		const beforeIdle = calls.length;
+		await handleGauntletSettled(dir, idle, host);
+		expect(calls.length).toBe(beforeIdle);
+		expect(loadGauntletState(dir)?.round).toBe(2);
+	});
+
+	it("a provider failure while awaiting a round stops honestly", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "gauntlet-loop-"));
+		dirs.push(dir);
+		writeCard(dir);
+		const session = createGauntletSession();
+		const { host, notices, setCmdCode } = fakeHost(dir);
+		setCmdCode(1);
+		await handleGauntletCommand("start", dir, session, host);
+		handleGauntletTransportFailure({ role: "assistant", stopReason: "error" }, dir, session, host);
+		expect(session.awaitingRound).toBe(false);
+		expect(loadGauntletState(dir)?.status).toBe("stopped-provider-error");
+		expect(loadGauntletState(dir)?.active).toBe(false);
+		expect(notices.some((n) => /provider failure/i.test(n))).toBe(true);
+	});
+
+	it("evaluateRound is a no-op while already evaluating or shutting down", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "gauntlet-loop-"));
+		dirs.push(dir);
+		writeCard(dir);
+		saveGauntletState(dir, {
+			active: true,
+			startedAt: "2026-08-16T00:00:00.000Z",
+			round: 0,
+			status: "running",
+			repeatCount: 0,
+			lastFingerprint: "",
+			strategyDirectiveIssued: false,
+			rounds: [],
+		});
+		const { host, calls } = fakeHost(dir);
+		const evaluating = createGauntletSession();
+		evaluating.evaluating = true;
+		await evaluateRound(dir, evaluating, host);
+		expect(calls).toHaveLength(0);
+		expect(loadGauntletState(dir)?.round).toBe(0);
+
+		const shutting = createGauntletSession();
+		shutting.shuttingDown = true;
+		await evaluateRound(dir, shutting, host);
+		expect(calls).toHaveLength(0);
+		expect(loadGauntletState(dir)?.round).toBe(0);
+	});
+
+	it("start resumes a running state instead of resetting the round counter", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "gauntlet-loop-"));
+		dirs.push(dir);
+		writeCard(dir);
+		saveGauntletState(dir, {
+			active: true,
+			startedAt: "2026-08-16T00:00:00.000Z",
+			round: 2,
+			status: "running",
+			repeatCount: 0,
+			lastFingerprint: "",
+			strategyDirectiveIssued: false,
+			rounds: [],
+		});
+		const { host, setCmdCode } = fakeHost(dir);
+		setCmdCode(1);
+		await handleGauntletCommand("start", dir, createGauntletSession(), host);
+		expect(loadGauntletState(dir)?.round).toBe(3);
 	});
 });

@@ -8,6 +8,7 @@ import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
+import { sanitizeVerifierCommands } from "./verifier-commands.ts";
 
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
@@ -907,7 +908,10 @@ export class SettingsManager {
 	}
 
 	getVerifySettings(): VerifySettings | undefined {
-		return this.settings.verify;
+		const verify = this.settings.verify;
+		if (!verify) return undefined;
+		if (!verify.verifierCommands?.length) return verify;
+		return { ...verify, verifierCommands: sanitizeVerifierCommands(verify.verifierCommands) };
 	}
 
 	getMinThinkingLevel(): ThinkingLevel | undefined {

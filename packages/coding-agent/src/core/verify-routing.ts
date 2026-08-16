@@ -52,6 +52,7 @@ import type {
 	UserMessage,
 } from "@earendil-works/pi-ai/compat";
 import type { VerifySettings, VerifyTierOverrides } from "./settings-manager.ts";
+import { isSafeVerifierCommand, sanitizeVerifierCommands } from "./verifier-commands.ts";
 
 /**
  * Rough token estimate: ~4 characters per token. Deliberately conservative
@@ -804,7 +805,8 @@ export function gatherDiffEvidence(cwd: string, kind: VerifyKind, opts: DiffEvid
 	if (status) overviewParts.push(`git status --short:\n${headLines(status, 30)}`);
 	if (stat) overviewParts.push(`git diff --stat HEAD:\n${headLines(stat, 40)}`);
 	if (kind !== "final") {
-		return overviewParts.join("\n\n").slice(0, maxChars);
+		const overview = overviewParts.join("\n\n");
+		return takeWithMarker(overview, maxChars, GOAL_DIFF_TRUNCATION_MARKER).text;
 	}
 
 	const skipUntracked = new Set(
@@ -970,7 +972,7 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 	const maxRejections = verify.maxRejections ?? 2;
 	const planAfterRejections = verify.planAfterRejections ?? 1;
 	const escalateAfterRejections = verify.escalateAfterRejections ?? 1;
-	const verifierCommands = verify.verifierCommands ?? [];
+	const verifierCommands = sanitizeVerifierCommands(verify.verifierCommands);
 	const maxCheckerRuns = verify.maxCheckerRuns ?? 2;
 	const stickyEscalation = verify.stickyEscalation ?? true;
 	const triageEnabled = verify.triage?.enabled ?? true;
@@ -1277,6 +1279,9 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 	})();
 
 	const execVerifierCommand = (command: string): string => {
+		if (!isSafeVerifierCommand(command) || !verifierCommands.includes(command)) {
+			return "refused: verifier command is not a single allowlisted command";
+		}
 		try {
 			return execSync(command, {
 				cwd: projectRoot,
@@ -1876,12 +1881,10 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 			// `moreChars` (or a comment saying "more chars") was treated as a
 			// truncation marker and falsely rejected. The real markers are
 			// structured phrases emitted by gatherDiffEvidence / boundContextForModel.
-			if (verdict === "verified" && kind === "final") {
+			if (verdict === "verified") {
 				const checkerSaw = boundedMessages.map((m) => messageText(m)).join("\n");
 				const truncatedGoal =
 					evidenceTruncationBlocksVerified(checkerSaw) || evidenceTruncationBlocksVerified(fullEvidence);
-				// Also catch the case where the full evidence contained a diff
-				// that the checker never saw: bounding dropped the whole message.
 				const fullHadDiff = /git diff HEAD|untracked/i.test(fullEvidence);
 				const checkerSawDiff = /git diff HEAD|untracked/i.test(checkerSaw);
 				const diffDroppedByBounding = fullHadDiff && !checkerSawDiff;
@@ -1894,14 +1897,16 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 							? "checker verified but bounding dropped the diff evidence"
 							: "checker verified but evidence was truncated",
 					});
-					emitRunSummary("unverified");
 					const base = demoteMaker();
+					if (kind === "final") emitRunSummary("unverified");
 					return {
 						status: "unverified",
 						model: base.model,
 						thinkingLevel: base.thinkingLevel,
 						notice:
-							"[VERIFY] UNVERIFIED — the goal-relevant diff was truncated (or dropped by bounding) and the checker could not see the full change. VERIFIED is illegal when evidence is incomplete.",
+							kind === "final"
+								? "[VERIFY] UNVERIFIED — the goal-relevant diff was truncated (or dropped by bounding) and the checker could not see the full change. VERIFIED is illegal when evidence is incomplete."
+								: "[VERIFY] UNVERIFIED — checkpoint evidence was truncated or dropped. Keep building; this checkpoint is not a pass.",
 					};
 				}
 			}
