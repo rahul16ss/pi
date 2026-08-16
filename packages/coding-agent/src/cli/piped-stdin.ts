@@ -11,6 +11,8 @@ export interface ReadPipedStdinOptions {
 	/** When false, stop waiting if no data arrives within idleTimeoutMs. Default true. */
 	waitForEnd?: boolean;
 	idleTimeoutMs?: number;
+	/** Max bytes to capture before stopping. Prevents unbounded memory growth from a large or infinite pipe. Default 10 MB. */
+	maxBytes?: number;
 }
 
 /**
@@ -26,6 +28,7 @@ export async function readPipedStdin(
 
 	const waitForEnd = opts.waitForEnd ?? true;
 	const idleTimeoutMs = opts.idleTimeoutMs ?? 50;
+	const maxBytes = opts.maxBytes ?? 10 * 1024 * 1024;
 
 	return new Promise((resolve) => {
 		let data = "";
@@ -44,6 +47,10 @@ export async function readPipedStdin(
 
 		const onData = (chunk: string | Buffer): void => {
 			data += String(chunk);
+			if (data.length >= maxBytes) {
+				finish();
+				return;
+			}
 			if (!waitForEnd) {
 				clearTimeout(idleTimer);
 				idleTimer = setTimeout(finish, idleTimeoutMs);

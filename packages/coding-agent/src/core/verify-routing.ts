@@ -31,7 +31,7 @@
  */
 
 import { execFileSync, execSync } from "node:child_process";
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type {
 	AgentLoopTurnUpdate,
@@ -573,14 +573,20 @@ function guardedExec(cwd: string, command: string, timeout = 2_000): string {
 	}
 }
 
-/** Read an untracked file without interpolating its name into a shell command. */
+/** Read an untracked file without interpolating its name into a shell command.
+ * Resolves symlinks so an in-repo link targeting a file outside the repo
+ * cannot leak external content to the checker. */
 export function readUntrackedFile(cwd: string, file: string): string {
 	if (!file || file.includes("\0") || isAbsolute(file)) return "";
 	const resolved = resolve(cwd, file);
 	const rel = relative(cwd, resolved);
 	if (!rel || rel.startsWith("..") || isAbsolute(rel)) return "";
 	try {
-		return readFileSync(resolved, { encoding: "utf8" });
+		// Resolve symlinks and re-check containment on the real target.
+		const real = realpathSync(resolved);
+		const realRel = relative(realpathSync(cwd), real);
+		if (!realRel || realRel.startsWith("..") || isAbsolute(realRel)) return "";
+		return readFileSync(real, { encoding: "utf8" });
 	} catch {
 		return "";
 	}
