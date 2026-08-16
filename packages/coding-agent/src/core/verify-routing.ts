@@ -921,10 +921,15 @@ export function gatherDiffEvidence(cwd: string, kind: VerifyKind, opts: DiffEvid
 		(opts.skipUntracked ?? []).map((p) => toRepoRelativePath(cwd, p)).filter((p): p is string => Boolean(p)),
 	);
 	const untracked = listUntracked(cwd).filter((f) => !skipUntracked.has(f));
-	const focusUntracked = focusSet.size === 0 ? untracked : untracked.filter((f) => focusSet.has(f));
-	const otherUntracked = focusSet.size === 0 ? [] : untracked.filter((f) => !focusSet.has(f));
-	const focusTake = takeUntracked(focusUntracked, UNTRACKED_READ_CAP);
-	const otherTake = takeUntracked(otherUntracked, 20);
+	// Every untracked file is goal-relevant: makers often create the requested
+	// artifact with bash, which collectTouchedPaths cannot see. Pack tool-touched
+	// names first, then the rest. Omitting any of them uses the goal truncation
+	// marker so VERIFIED cannot pass silently.
+	const prioritizedUntracked = [
+		...untracked.filter((f) => focusSet.has(f)),
+		...untracked.filter((f) => !focusSet.has(f)),
+	];
+	const focusTake = takeUntracked(prioritizedUntracked, UNTRACKED_READ_CAP);
 
 	const goalDiff =
 		focusPaths.length > 0
@@ -953,11 +958,6 @@ export function gatherDiffEvidence(cwd: string, kind: VerifyKind, opts: DiffEvid
 
 	const otherChunks: string[] = [];
 	if (otherDiff) otherChunks.push(`git diff HEAD (other working-tree files):\n${otherDiff}`);
-	const otherUntrackedBody = formatUntracked(otherTake.files, cwd);
-	if (otherUntrackedBody) otherChunks.push(`Other untracked files:\n${otherUntrackedBody}`);
-	if (otherTake.omitted > 0) {
-		otherChunks.push(`${OTHER_DIFF_TRUNCATION_MARKER}\n[${otherTake.omitted} more untracked files not shown]`);
-	}
 
 	const overview = overviewParts.join("\n\n");
 	const packed: string[] = overview ? [overview] : [];

@@ -1627,7 +1627,8 @@ describe("readUntrackedFile", () => {
 		writeFileSync(join(dir, "zzz-goal.ts"), "export const goal = 1;\n");
 		const evidence = gatherDiffEvidence(dir, "final", { focusPaths: ["zzz-goal.ts"] });
 		expect(evidence).toContain("export const goal = 1");
-		expect(evidenceTruncationBlocksVerified(evidence)).toBe(false);
+		expect(evidence).toContain(GOAL_DIFF_TRUNCATION_MARKER);
+		expect(evidenceTruncationBlocksVerified(evidence)).toBe(true);
 	});
 
 	it("marks omitted untracked files so a silent VERIFIED is illegal", () => {
@@ -1638,5 +1639,16 @@ describe("readUntrackedFile", () => {
 		const evidence = gatherDiffEvidence(dir, "final");
 		expect(evidence).toContain(GOAL_DIFF_TRUNCATION_MARKER);
 		expect(evidenceTruncationBlocksVerified(evidence)).toBe(true);
+	});
+
+	it("treats bash-created untracked files as goal evidence even when another path was touched", () => {
+		const dir = gitRepo();
+		for (let i = 0; i < 20; i++) {
+			writeFileSync(join(dir, `aaa-${String(i).padStart(2, "0")}.txt`), "noise\n");
+		}
+		writeFileSync(join(dir, "zzz-via-bash.ts"), "export const viaBash = 1;\n");
+		const evidence = gatherDiffEvidence(dir, "final", { focusPaths: ["tracked.txt"] });
+		expect(evidence).toContain("export const viaBash = 1");
+		expect(evidenceTruncationBlocksVerified(evidence)).toBe(false);
 	});
 });
