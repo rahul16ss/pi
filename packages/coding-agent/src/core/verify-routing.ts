@@ -39,6 +39,7 @@ import {
 	lstatSync,
 	openSync,
 	readFileSync,
+	readlinkSync,
 	readSync,
 	realpathSync,
 	type Stats,
@@ -597,6 +598,39 @@ function untrackedOpenFlags(): number {
 	return constants.O_RDONLY | nofollow | nonblock;
 }
 
+function isInsideWorkspace(cwd: string, candidate: string): boolean {
+	const rel = relative(cwd, candidate);
+	return Boolean(rel) && !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+/** Kernel path of an open descriptor. Empty means "could not verify" — callers fail closed. */
+function pathOfOpenFd(fd: number): string {
+	try {
+		if (process.platform === "linux") {
+			return realpathSync(readlinkSync(`/proc/self/fd/${fd}`));
+		}
+		if (process.platform === "darwin") {
+			const out = execFileSync("lsof", ["-Fn", "-p", String(process.pid), "-a", "-d", String(fd)], {
+				encoding: "utf8",
+				timeout: 2_000,
+				stdio: ["ignore", "pipe", "ignore"],
+			});
+			const line = out.split("\n").find((l) => l.startsWith("n"));
+			return line ? realpathSync(line.slice(1)) : "";
+		}
+	} catch {
+		return "";
+	}
+	return "";
+}
+
+function openedFdIsInsideWorkspace(cwd: string, fd: number): boolean {
+	if (process.platform === "win32") return true;
+	const openedPath = pathOfOpenFd(fd);
+	if (!openedPath) return false;
+	return isInsideWorkspace(realpathSync(cwd), openedPath);
+}
+
 /** Read from an already-opened descriptor so type/size/content cannot change under us. */
 function readOpenedUntracked(fd: number): string {
 	const opened = fstatSync(fd);
@@ -618,8 +652,9 @@ function readOpenedUntracked(fd: number): string {
 /** Read an untracked file without interpolating its name into a shell command.
  * Resolves symlinks so an in-repo link targeting a file outside the repo
  * cannot leak external content to the checker. Opens the resolved path with
- * O_NOFOLLOW | O_NONBLOCK and reads from that descriptor after fstat, so a
- * concurrent replacement cannot swap in a symlink, FIFO, or oversized file.
+ * O_NOFOLLOW | O_NONBLOCK, re-checks the kernel path of that descriptor against
+ * the workspace (so a swapped intermediate directory cannot escape), then
+ * fstat/reads the same descriptor so type and size cannot change under us.
  * Oversized regular files return a truncation marker instead of being read
  * in full. */
 export function readUntrackedFile(cwd: string, file: string): string {
@@ -637,6 +672,7 @@ export function readUntrackedFile(cwd: string, file: string): string {
 		const targetStat = lstatSync(real);
 		if (!targetStat.isFile() || isUnsafeUntrackedTarget(targetStat)) return "";
 		fd = openSync(real, untrackedOpenFlags());
+		if (!openedFdIsInsideWorkspace(cwd, fd)) return "";
 		return readOpenedUntracked(fd);
 	} catch {
 		return "";

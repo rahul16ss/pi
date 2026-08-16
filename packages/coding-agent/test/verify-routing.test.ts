@@ -1585,6 +1585,13 @@ describe("readUntrackedFile", () => {
 		expect(readUntrackedFile(dir, "alias.ts")).toContain("export const inside = true");
 	});
 
+	it("reads a nested untracked file whose path has intermediate directories", () => {
+		const dir = gitRepo();
+		mkdirSync(join(dir, "sub"));
+		writeFileSync(join(dir, "sub", "nested.ts"), "export const nested = 1;\n");
+		expect(readUntrackedFile(dir, "sub/nested.ts")).toContain("export const nested = 1");
+	});
+
 	it("skips FIFOs instead of blocking on an unbounded read", () => {
 		if (process.platform === "win32") return;
 		const dir = gitRepo();
