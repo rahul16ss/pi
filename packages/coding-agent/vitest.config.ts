@@ -15,8 +15,14 @@ export default mergeConfig(
 			reporters: process.env.GITHUB_ACTIONS ? ["dot", "github-actions"] : ["dot"],
 			silent: "passed-only",
 			// gauntlet-extension.test.ts imports from ~/.pi/agent/extensions/gauntlet.ts
-			// which only exists on the user's machine, not on CI.
-			exclude: ["**/gauntlet-extension.test.ts", "**/node_modules/**", "**/dist/**"],
+			// and harness-eval-gate.test.ts has live-config tests that read
+			// ~/.pi/agent/settings.json — both only exist on the user's machine.
+			exclude: [
+				"**/gauntlet-extension.test.ts",
+				"**/harness-eval-gate.test.ts",
+				"**/node_modules/**",
+				"**/dist/**",
+			],
 			server: {
 				deps: {
 					external: [/@silvia-odwyer\/photon-node/],
