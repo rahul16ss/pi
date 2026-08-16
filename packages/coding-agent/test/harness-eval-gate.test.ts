@@ -383,8 +383,25 @@ describe("harness eval gate", () => {
 			expect(existsSync(join(sandboxDir, "index.ts"))).toBe(true);
 			const cfgPath = join(homedir(), ".pi", "agent", "extensions", "sandbox.json");
 			expect(existsSync(cfgPath)).toBe(true);
-			const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as { filesystem?: { denyRead?: string[] } };
+			const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as {
+				filesystem?: { denyRead?: string[]; allowWrite?: string[] };
+				network?: { allowLocalBinding?: boolean };
+			};
 			expect(cfg.filesystem?.denyRead?.some((p) => p.includes("auth.json") || p.includes(".ssh"))).toBe(true);
+			expect(cfg.filesystem?.allowWrite).toEqual(expect.arrayContaining(["/tmp", "/private/tmp"]));
+			expect(cfg.network?.allowLocalBinding).toBe(true);
+		});
+
+		it("eval: live verify has no wall-clock cap, a $100 cost ceiling, and does not allowlist npm test", () => {
+			const livePath = join(homedir(), ".pi", "agent", "settings.json");
+			if (!existsSync(livePath)) throw new Error("live settings.json is the contract under test");
+			const live = JSON.parse(readFileSync(livePath, "utf8")) as {
+				verify?: { maxRunMs?: number; maxRunCostUsd?: number; verifierCommands?: string[] };
+			};
+			expect(live.verify?.maxRunMs).toBe(0);
+			expect(live.verify?.maxRunCostUsd).toBe(100);
+			expect(live.verify?.verifierCommands ?? []).not.toContain("npm test");
+			expect(live.verify?.verifierCommands).toEqual(expect.arrayContaining(["npm run check"]));
 		});
 
 		it("eval: live gauntlet critic is Luna, the live checker — not a fourth model", () => {
@@ -759,6 +776,36 @@ describe("harness eval gate", () => {
 			const runOutput = captured.join("\n").split("Output of `npm test`").slice(1).join("\n");
 			expect(runOutput).toContain("RAN_FROM_NEAREST_PACKAGE");
 			expect(runOutput).not.toContain("RAN_FROM_GIT_ROOT");
+		});
+
+		it("eval: verifier commands refuse when cwd has no package.json", async () => {
+			const dir = mkdtempSync(join(tmpdir(), "pi-eval-home-"));
+			dirs.push(dir);
+			const { routing, replies, runModel } = setup(
+				{ planFirst: false, verifierCommands: ["npm test"], triage: { enabled: false } },
+				dir,
+			);
+			if (!routing) throw new Error("routing required");
+			const captured: string[] = [];
+			const capturingRunModel = async (model: Model<any>, msgs: AgentMessage[]) => {
+				captured.push(msgs.map((m) => messageText(m)).join("\n"));
+				return runModel(model, msgs);
+			};
+			replies["moonshotai/kimi-k3"] = ["RUN: npm test", "VERDICT: VERIFIED"];
+			await routing.verifyTurn({
+				kind: "final",
+				message: assistant("done"),
+				context: { systemPrompt: "", messages: [], tools: [] },
+				newMessages: [
+					{ role: "user", content: "Add a helper.", timestamp: Date.now() },
+					toolResult("bash", "edited"),
+				],
+				config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+				runModel: capturingRunModel,
+			} as unknown as VerifyTurnContext);
+			const joined = captured.join("\n");
+			expect(joined).toMatch(/no package\.json/);
+			expect(joined).not.toMatch(/RAN_FROM/);
 		});
 	});
 
@@ -1492,6 +1539,15 @@ describe("harness eval gate", () => {
 			expect(focused).not.toContain(GOAL_DIFF_TRUNCATION_MARKER);
 			expect(evidenceTruncationBlocksVerified(focused)).toBe(false);
 			expect(collectTouchedPaths([toolCall("edit", { path: "helper.ts" })], dir)).toEqual(["helper.ts"]);
+			expect(
+				collectTouchedPaths(
+					[
+						toolCall("edit", { path: "helper.ts" }),
+						toolCall("bash", { command: "npx vitest run paths.test.ts ok" }),
+					],
+					dir,
+				),
+			).toEqual(["helper.ts"]);
 			replies["moonshotai/kimi-k3"] = ["VERDICT: VERIFIED"];
 			const result = await routing.verifyTurn({
 				kind: "final",
@@ -1508,6 +1564,34 @@ describe("harness eval gate", () => {
 			} as unknown as VerifyTurnContext);
 			expect(result?.status).toBe("verified");
 			expect(readAudit().some((e) => e.event === "truncation-override")).toBe(false);
+		});
+
+		it("eval: a bash-edited tracked file stays in goal evidence when edit touched another path", () => {
+			const dir = mkdtempSync(join(tmpdir(), "pi-eval-"));
+			dirs.push(dir);
+			gitInit(dir);
+			writeFileSync(join(dir, "helper.ts"), "export const before = 1;\n");
+			writeFileSync(join(dir, "goal.ts"), "export const goal = 'old';\n");
+			writeFileSync(join(dir, "unrelated.ts"), "old-unrelated\n");
+			execSync("git add helper.ts goal.ts unrelated.ts && git commit --no-gpg-sign -m init", {
+				cwd: dir,
+				stdio: "ignore",
+			});
+			writeFileSync(join(dir, "helper.ts"), "export function hasLeadingTilde() { return true; }\n");
+			writeFileSync(join(dir, "goal.ts"), "export const goal = 'BASH_TRACKED_MARKER';\n");
+			writeFileSync(join(dir, "unrelated.ts"), `${"x".repeat(500)}\n`);
+			const focus = collectTouchedPaths(
+				[
+					toolCall("edit", { path: "helper.ts" }),
+					toolCall("bash", { command: "python3 -c \"open('goal.ts','w').write('export const goal = 1\\n')\"" }),
+				],
+				dir,
+			);
+			expect(focus).toEqual(expect.arrayContaining(["helper.ts", "goal.ts"]));
+			const evidence = gatherDiffEvidence(dir, "final", { focusPaths: focus });
+			expect(evidence).toContain("BASH_TRACKED_MARKER");
+			const otherBlock = evidence.split("git diff HEAD (other working-tree files):")[1] ?? "";
+			expect(otherBlock).not.toContain("BASH_TRACKED_MARKER");
 		});
 
 		it("eval: a read-only task in a dirty tree may still be verified", async () => {

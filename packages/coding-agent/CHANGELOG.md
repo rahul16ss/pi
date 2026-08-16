@@ -16,6 +16,12 @@
 - Untracked reads open the resolved path with `O_NOFOLLOW`/`O_NONBLOCK`, re-check the kernel path of that descriptor against the workspace, and `fstat` it before reading, so a concurrent replacement cannot swap in a symlink, FIFO, oversized file, or outside-workspace target after the path checks.
 - Untracked file names are enumerated in full and treated as goal evidence (tool-touched names packed first). Omitted untracked files emit the goal truncation marker so a checker cannot VERIFIED a bash-created artifact it never saw.
 - The gauntlet M1 metric clusters conflict records rather than characters.
+- Wall-clock `maxRunMs` is no longer a default hurdle (0 = unlimited). Live `maxRunCostUsd` is 100, not 5.
+- Verifier commands refuse to run when no `package.json` exists above cwd (home-folder `npm test` exit 254).
+- `shouldStopAfterTurn` notices are emitted to the TUI instead of being stuffed into the transcript silently.
+- Continue / health-audit / self-test prompts are floored off TRIVIAL so planning still runs.
+- Audit/health goals can VERIFIED on evidenced findings even when product tests are red.
+- Mutating bash (sed, redirects, interpreters) treats every dirty tracked file as goal evidence so a bash-edited artifact cannot hide in otherDiff.
 
 ## [0.84.2] - 2026-08-14
 

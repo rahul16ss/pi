@@ -1206,6 +1206,49 @@ describe("agentLoop with AgentMessage", () => {
 		]);
 	});
 
+	it("emits a user notice pushed by shouldStopAfterTurn before ending", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [],
+		};
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			shouldStopAfterTurn: ({ newMessages }) => {
+				newMessages.push({
+					role: "user",
+					content: "[VERIFY] STOPPED_UNVERIFIED — run ended on max-tool-calls (120).",
+					timestamp: Date.now(),
+				});
+				return true;
+			},
+		};
+		const stream = agentLoop([createUserMessage("hello")], context, config, undefined, () => {
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				mockStream.push({
+					type: "done",
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text: "working" }]),
+				});
+			});
+			return mockStream;
+		});
+		const events: AgentEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const notice = events.find(
+			(event) =>
+				event.type === "message_end" &&
+				"message" in event &&
+				typeof (event as { message?: { content?: unknown } }).message?.content === "string" &&
+				String((event as { message: { content: string } }).message.content).includes("STOPPED_UNVERIFIED"),
+		);
+		expect(notice).toBeTruthy();
+	});
+
 	it("should stop after a tool batch when every tool result sets terminate=true", async () => {
 		const toolSchema = Type.Object({ value: Type.String() });
 		const tool: AgentTool<typeof toolSchema, { value: string }> = {

@@ -201,11 +201,13 @@ export interface VerifySettings {
 	maxToolCallsPerRun?: number;
 	/**
 	 * Whole-run wall-clock deadline in milliseconds (F-01). 0 = unlimited.
+	 * Prefer the cost and turn caps for cheap models; a wall-clock cap kills
+	 * long honest work (health audits, full checks) without saving money.
 	 */
 	maxRunMs?: number;
 	/**
 	 * Whole-run total-cost ceiling in USD, summing verify-path + maker calls
-	 * tracked by the routing layer (F-01). 0 = unlimited.
+	 * tracked by the routing layer (F-01). 0 = unlimited. Live default is 100.
 	 */
 	maxRunCostUsd?: number;
 	/**

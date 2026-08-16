@@ -403,6 +403,7 @@ async function runLoop(
 				};
 			}
 
+			const stopNoticeFrom = newMessages.length;
 			if (
 				await config.shouldStopAfterTurn?.({
 					message,
@@ -411,6 +412,10 @@ async function runLoop(
 					newMessages,
 				})
 			) {
+				for (const extra of newMessages.slice(stopNoticeFrom)) {
+					await emit({ type: "message_start", message: extra });
+					await emit({ type: "message_end", message: extra });
+				}
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
 			}

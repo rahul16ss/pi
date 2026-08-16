@@ -35,6 +35,7 @@ import {
 	appendFileSync,
 	closeSync,
 	constants,
+	existsSync,
 	fstatSync,
 	lstatSync,
 	openSync,
@@ -386,10 +387,60 @@ export function buildTriagePrompt(opts: { promptText: string; signals?: string; 
 		"STANDARD: a normal feature, fix, refactor, or a real question about the code or design.\n" +
 		"HARD: multi-file or architectural work, tricky debugging, concurrency, migrations, security-sensitive code, or an uncertain approach.\n" +
 		"A greeting is TRIVIAL even when it uses the assistant's name. Do not treat small talk as a planning task.\n" +
+		"Never classify as TRIVIAL: continue / keep going / have you finished, health or stress tests, self-tests, audits, or log investigations. Those are STANDARD or HARD.\n" +
 		goalNote +
 		`Message:\n${opts.promptText.slice(0, 2_000)}` +
 		signals
 	);
+}
+
+const CLOSING_SMALL_TALK = /^(thanks|thank you|ok|okay|ok thanks|cool|great|hi|hello|hey|bye)[\s!.]*$/i;
+const CONTINUE_WORK =
+	/\b(continue|keep going|keep working|not finished|haven't finished|have you finished|finaliz\w*|follow up|stress[- ]?test|self[- ]?test|health|audit|investigate logs|watch(?:ing)? (?:your )?logs)\b/i;
+
+/** Audit/review/health goals are done when findings are evidenced, not when the product suite is green. */
+export function isDiscoveryAuditGoal(promptText: string): boolean {
+	return /\b(health|stress[- ]?test|self[- ]?test|audit|investigate logs|report (?:all )?(?:concerns|findings)|watch(?:ing)? (?:your )?logs)\b/i.test(
+		promptText,
+	);
+}
+
+/**
+ * Cheap triage (thinking off) under-classifies long-horizon follow-ups as
+ * TRIVIAL. Floor those to STANDARD so planning and checkpoints still run.
+ * Pure thanks/greetings stay TRIVIAL.
+ */
+export function floorTriageTier(opts: {
+	promptText: string;
+	classified: VerifyTier;
+	goalActive: boolean;
+	lastOutcome?: "verified" | "unverified" | "stopped";
+}): VerifyTier {
+	if (opts.classified === "hard") return "hard";
+	if (opts.classified === "standard") return "standard";
+	const trimmed = opts.promptText.trim();
+	if (CLOSING_SMALL_TALK.test(trimmed)) return "trivial";
+	const unfinished = opts.lastOutcome === "stopped" || opts.lastOutcome === "unverified";
+	if (CONTINUE_WORK.test(opts.promptText) || isDiscoveryAuditGoal(opts.promptText)) return "standard";
+	if (opts.goalActive && trimmed.length > 0) return "standard";
+	if (unfinished && trimmed.length > 0) return "standard";
+	return "trivial";
+}
+
+/**
+ * Nearest package.json above cwd. Returns null when the session is not inside
+ * a Node project (e.g. home directory) so verifier commands cannot run `npm test`
+ * from a folder that has no package.json (exit 254).
+ */
+export function resolveVerifierCwd(startCwd: string, maxHops = 10): string | null {
+	let dir = startCwd;
+	for (let i = 0; i < maxHops; i++) {
+		if (existsSync(join(dir, "package.json"))) return dir;
+		const parent = resolve(dir, "..");
+		if (parent === dir) break;
+		dir = parent;
+	}
+	return null;
 }
 
 function tierOverrides(verify: VerifySettings, tier: VerifyTier): VerifyTierOverrides | undefined {
@@ -530,11 +581,21 @@ export function createVerifyAuditLogger(auditLogPath: string): (entry: Record<st
 	};
 }
 
-function usageFields(m: AssistantMessage): { tokensIn: number; tokensOut: number; costUsd: number } {
-	const usage = (m as { usage?: { input?: number; output?: number; cost?: { total?: number } } }).usage;
+function usageFields(m: AssistantMessage): {
+	tokensIn: number;
+	tokensOut: number;
+	tokensCacheRead: number;
+	costUsd: number;
+} {
+	const usage = (
+		m as {
+			usage?: { input?: number; output?: number; cacheRead?: number; cost?: { total?: number } };
+		}
+	).usage;
 	return {
 		tokensIn: usage?.input ?? 0,
 		tokensOut: usage?.output ?? 0,
+		tokensCacheRead: usage?.cacheRead ?? 0,
 		costUsd: usage?.cost?.total ?? 0,
 	};
 }
@@ -774,6 +835,28 @@ export const OTHER_DIFF_TRUNCATION_MARKER = "[... TRUNCATED: other working-tree 
 
 const MUTATING_TOOL_NAMES = new Set(["edit", "write"]);
 const READ_TOOL_NAMES = new Set(["read"]);
+const SHELL_TOOL_NAMES = new Set(["bash"]);
+/** Redirects to a real path, in-place editors, and interpreters that can write files. */
+const MUTATING_SHELL =
+	/(?:^|[;&|]\s*)(?:sed\s+-i|tee\b|mv\b|cp\b|rm\b|mkdir\b|touch\b|chmod\b|dd\b|truncate\b|perl\s+-i)|(?:^|[;&|]\s*)(?:python3?|node|nodejs|perl|ruby|php|osascript|swift|deno)\b|(?:^|[^0-9&])>>?(?!&|\/dev\/)/;
+
+function shellCommandOf(args: unknown): string | undefined {
+	if (args && typeof args === "object" && typeof (args as { command?: unknown }).command === "string") {
+		return (args as { command: string }).command.trim();
+	}
+	return undefined;
+}
+
+function shellLooksMutating(command: string): boolean {
+	return MUTATING_SHELL.test(command);
+}
+
+function dirtyTrackedFiles(cwd: string): string[] {
+	return guardedGit(cwd, ["diff", "--name-only", "HEAD"], 3_000)
+		.split("\n")
+		.map((line) => line.trim())
+		.filter(Boolean);
+}
 
 export interface DiffEvidenceOptions {
 	maxChars?: number;
@@ -823,10 +906,16 @@ function toRepoRelativePath(cwd: string, filePath: string | undefined): string |
  * (not from scanning prose). Mutating edit/write paths win; if the maker
  * never wrote a file, read paths are the focus so a dirty tree does not
  * swallow a Q&A or lint task.
+ *
+ * Bash has no `path` argument. A mutating shell command (sed -i, redirects,
+ * interpreters) is treated as dirtying every tracked change so a bash-edited
+ * goal file cannot be parked in otherDiff and truncated without blocking
+ * VERIFIED. Test/lint runners are not mutating.
  */
 export function collectTouchedPaths(messages: AgentMessage[], cwd: string): string[] {
 	const mutated = new Set<string>();
 	const read = new Set<string>();
+	let mutatingShell = false;
 	for (const m of messages) {
 		if ((m as { role?: string }).role !== "assistant") continue;
 		const content = (m as { content?: unknown }).content;
@@ -836,6 +925,11 @@ export function collectTouchedPaths(messages: AgentMessage[], cwd: string): stri
 			const b = block as { type?: string; name?: string; arguments?: unknown };
 			if (b.type !== "toolCall" || !b.name) continue;
 			const args = b.arguments;
+			if (SHELL_TOOL_NAMES.has(b.name)) {
+				const command = shellCommandOf(args);
+				if (!command || shellLooksMutating(command)) mutatingShell = true;
+				continue;
+			}
 			const path =
 				args && typeof args === "object" && typeof (args as { path?: unknown }).path === "string"
 					? (args as { path: string }).path
@@ -845,6 +939,9 @@ export function collectTouchedPaths(messages: AgentMessage[], cwd: string): stri
 			if (MUTATING_TOOL_NAMES.has(b.name)) mutated.add(rel);
 			else if (READ_TOOL_NAMES.has(b.name)) read.add(rel);
 		}
+	}
+	if (mutatingShell) {
+		for (const file of dirtyTrackedFiles(cwd)) mutated.add(file);
 	}
 	return mutated.size > 0 ? [...mutated] : [...read];
 }
@@ -1124,6 +1221,7 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 	// after an active goal are follow-ups, not new conversational prompts.
 	let goalActive = false;
 	let missingSpareWarned = false;
+	let lastOutcome: "verified" | "unverified" | "stopped" | undefined;
 
 	const warnMissingSpareOnce = (): void => {
 		if (missingSpareWarned) return;
@@ -1286,6 +1384,7 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 			toolCallsTotal,
 			elapsedMs: runStartedAt ? Date.now() - runStartedAt : 0,
 		});
+		lastOutcome = outcome;
 	};
 
 	interface TierView {
@@ -1373,35 +1472,23 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 		return { model: view.maker, thinkingLevel: view.makerThinking, escalated: false };
 	};
 
-	// F-04: resolve the working directory for verifier commands (npm test,
-	// npm run check) to the nearest package.json from the session cwd, not
-	// the git root. In a monorepo, running from the git root would run the
-	// wrong tests or fail for the wrong reason. Falls back to cwd if no
-	// package.json is found.
-	const projectRoot = (() => {
-		// Walk up from cwd to find the nearest package.json
-		let dir = cwd;
-		for (let i = 0; i < 10; i++) {
-			try {
-				readFileSync(join(dir, "package.json"), "utf8");
-				return dir;
-			} catch {
-				const parent = join(dir, "..");
-				if (parent === dir) break;
-				dir = parent;
-			}
-		}
-		return cwd;
-	})();
+	// F-04: resolve the working directory for verifier commands to the nearest
+	// package.json from the session cwd, not the git root. Refuse (do not fall
+	// back to cwd) when no package.json exists — a home-folder session would
+	// otherwise run `npm test` and get npm exit 254.
+	const projectRoot = resolveVerifierCwd(cwd);
 
 	const execVerifierCommand = (command: string): string => {
 		if (!isSafeVerifierCommand(command) || !verifierCommands.includes(command)) {
 			return "refused: verifier command is not a single allowlisted command";
 		}
+		if (!projectRoot) {
+			return `refused: no package.json above ${cwd}; not running verifier commands from a non-project directory`;
+		}
 		try {
 			return execSync(command, {
 				cwd: projectRoot,
-				timeout: 120_000,
+				timeout: 600_000,
 				encoding: "utf8",
 				maxBuffer: 4 * 1024 * 1024,
 				stdio: ["ignore", "pipe", "pipe"],
@@ -1468,10 +1555,16 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 			: checkerThinkingForKind(verify, kind, tier);
 		const fallbackThinkingLevel = checkerFallbackThinkingForKind(verify, kind, tier);
 
+		const firstUser = vctx.newMessages.find((m) => m.role === "user");
+		const goalText = firstUser ? messageText(firstUser) : "";
+		const discoveryGoal = isDiscoveryAuditGoal(goalText);
 		const runInstruction = verifierCommands.length
 			? ` If you need fresh evidence before judging, reply EXACTLY "RUN: <command>" with one of: ${verifierCommands.join(
 					", ",
 				)}. The harness — not the maker — runs it and you receive the raw output. You may request up to ${maxCheckerRuns} commands, one per reply.`
+			: "";
+		const discoveryInstruction = discoveryGoal
+			? " This goal is an audit, review, or health report. Return VERIFIED if the findings are evidenced by receipts even when those receipts show product tests failing or a stress test being blocked. Do not CONFLICT solely because the product suite is red or the maker reported FAILED with evidence. CONFLICT if the report is unevidenced, incomplete, or overclaims a pass."
 			: "";
 		// The verdict-line instruction goes LAST so it is the most recent constraint
 		// before the checker answers. It matters that EXCELLENCE_CHARTER itself
@@ -1495,12 +1588,11 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 					"CONFLICT verdict if the answer is wrong, incomplete, or its claims are unverified, and state the " +
 					"specific problem after the verdict line. If the evidence notes other working-tree files not " +
 					"touched this run, those are pre-existing workspace dirt — do not CONFLICT solely because of them.") +
+			discoveryInstruction +
 			` ${EXCELLENCE_CHARTER}` +
 			runInstruction +
 			` ${CHECKER_VERDICT_LINE_INSTRUCTION}`;
 
-		const firstUser = vctx.newMessages.find((m) => m.role === "user");
-		const goalText = firstUser ? messageText(firstUser) : "";
 		const receipts = vctx.newMessages
 			.filter((m): m is ToolResultMessage => m.role === "toolResult")
 			.slice(-10)
@@ -1740,8 +1832,17 @@ export function createVerifyRouting(options: CreateVerifyRoutingOptions): Verify
 						{ thinkingLevel: verify.triage?.thinkingLevel ?? "off" },
 					);
 					const cost = trackCost(reply);
-					tier = classifyTriageTier(messageText(reply)) ?? "standard";
-					logVerify({ event: "triage", tier, via: triageModel.id, ...cost });
+					const classified = classifyTriageTier(messageText(reply)) ?? "standard";
+					tier = floorTriageTier({
+						promptText,
+						classified,
+						goalActive: hadGoal,
+						lastOutcome,
+					});
+					logVerify({ event: "triage", tier, via: triageModel.id, classified, ...cost });
+					if (tier !== classified) {
+						logVerify({ event: "triage-floored", from: classified, to: tier });
+					}
 				} catch (error) {
 					tier = "standard";
 					logVerify({

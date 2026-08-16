@@ -13,16 +13,21 @@ import {
 	checkerRefForKind,
 	classifyCheckerVerdict,
 	classifyTriageTier,
+	collectTouchedPaths,
 	createVerifyRouting,
 	EXCELLENCE_CHARTER,
 	evidenceTruncationBlocksVerified,
 	extractModelFamily,
+	floorTriageTier,
 	GOAL_DIFF_TRUNCATION_MARKER,
 	gatherDiffEvidence,
+	isDiscoveryAuditGoal,
 	messageText,
+	OTHER_DIFF_TRUNCATION_MARKER,
 	parseCheckerVerdict,
 	readUntrackedFile,
 	redactEvidence,
+	resolveVerifierCwd,
 	selectAuditChecker,
 	shouldEscalateMaker,
 	shouldPlanFirst,
@@ -244,6 +249,50 @@ describe("buildTriagePrompt", () => {
 		const prompt = buildTriagePrompt({ promptText: "yes", goalActive: true });
 		expect(prompt).toContain("already in progress");
 		expect(prompt).toContain("yes");
+	});
+
+	it("forbids classifying continue/health/self-test follow-ups as TRIVIAL", () => {
+		const prompt = buildTriagePrompt({ promptText: "have you finalized yet?" });
+		expect(prompt).toMatch(/Never classify as TRIVIAL/);
+		expect(prompt).toMatch(/health or stress tests/);
+	});
+});
+
+describe("floorTriageTier / isDiscoveryAuditGoal / resolveVerifierCwd", () => {
+	it("floors continue and health-audit prompts off TRIVIAL", () => {
+		expect(
+			floorTriageTier({
+				promptText: "have you finalized yet?",
+				classified: "trivial",
+				goalActive: false,
+			}),
+		).toBe("standard");
+		expect(
+			floorTriageTier({
+				promptText: "aggressively stress testing yourself and watching your logs",
+				classified: "trivial",
+				goalActive: false,
+			}),
+		).toBe("standard");
+		expect(isDiscoveryAuditGoal("investigate logs and report health concerns")).toBe(true);
+	});
+
+	it("keeps thanks and hi as TRIVIAL even when a goal is active", () => {
+		expect(
+			floorTriageTier({ promptText: "thanks", classified: "trivial", goalActive: true, lastOutcome: "verified" }),
+		).toBe("trivial");
+		expect(floorTriageTier({ promptText: "Hi Pi", classified: "trivial", goalActive: false })).toBe("trivial");
+	});
+
+	it("does not walk verifier cwd to a non-project directory", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-no-pkg-"));
+		try {
+			expect(resolveVerifierCwd(dir)).toBeNull();
+			writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "here" }));
+			expect(resolveVerifierCwd(dir)).toBe(dir);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -491,6 +540,31 @@ describe("createVerifyRouting", () => {
 		expect(audit.some((e) => e.event === "triage" && e.tier === "trivial" && e.via === "heuristic")).toBe(false);
 		expect(audit.some((e) => e.event === "triage" && e.tier === "trivial")).toBe(true);
 		expect(audit.some((e) => e.event === "plan-skipped" && e.reason === "trivial-tier")).toBe(true);
+	});
+
+	it("floors a health-audit follow-up that triage mislabels TRIVIAL", async () => {
+		const { routing, replies, runModel, auditLogPath } = setup({
+			triage: { enabled: true },
+			planFirst: true,
+		});
+		replies["deepseek/deepseek-v4-flash-0731"] = ["TRIVIAL"];
+		replies["anthropic/claude-opus-5"] = ["1. read the logs\n2. report findings"];
+		await routing.beforeFirstTurn({
+			context: { systemPrompt: "", messages: [], tools: [] },
+			newMessages: [
+				{
+					role: "user",
+					content: "have you finalized yet? Also isn't this a failure that you halt without warnings?",
+					timestamp: Date.now(),
+				},
+			],
+			config: { model: modelWithId("deepseek/deepseek-v4-flash-0731"), convertToLlm: () => [] },
+			runModel,
+		} as unknown as BeforeFirstTurnContext);
+		const audit = readAudit(auditLogPath);
+		expect(audit.some((e) => e.event === "triage-floored" && e.from === "trivial" && e.to === "standard")).toBe(true);
+		expect(audit.some((e) => e.event === "triage" && e.tier === "standard")).toBe(true);
+		expect(audit.some((e) => e.event === "plan-skipped" && e.reason === "trivial-tier")).toBe(false);
 	});
 
 	it("schedules checkpoints every N tool turns up to max", () => {
@@ -1649,6 +1723,73 @@ describe("readUntrackedFile", () => {
 		writeFileSync(join(dir, "zzz-via-bash.ts"), "export const viaBash = 1;\n");
 		const evidence = gatherDiffEvidence(dir, "final", { focusPaths: ["tracked.txt"] });
 		expect(evidence).toContain("export const viaBash = 1");
+		expect(evidenceTruncationBlocksVerified(evidence)).toBe(false);
+	});
+});
+
+describe("collectTouchedPaths bash mutations", () => {
+	const dirs: string[] = [];
+	afterEach(() => {
+		for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+	});
+
+	function gitRepo(): string {
+		const dir = mkdtempSync(join(tmpdir(), "pi-bash-touch-"));
+		dirs.push(dir);
+		execSync("git init", { cwd: dir, stdio: "ignore" });
+		execSync('git config user.email "eval@test"', { cwd: dir, stdio: "ignore" });
+		execSync('git config user.name "eval"', { cwd: dir, stdio: "ignore" });
+		writeFileSync(join(dir, "helper.ts"), "export const before = 1;\n");
+		writeFileSync(join(dir, "goal.ts"), "export const goal = 'old';\n");
+		writeFileSync(join(dir, "unrelated.ts"), "old-unrelated\n");
+		execSync("git add helper.ts goal.ts unrelated.ts && git commit --no-gpg-sign -m init", {
+			cwd: dir,
+			stdio: "ignore",
+		});
+		return dir;
+	}
+
+	function toolCall(name: string, args: Record<string, unknown>): AgentMessage {
+		return {
+			...assistant("", "mock"),
+			content: [{ type: "toolCall", id: `call_${name}`, name, arguments: args }],
+			stopReason: "toolUse",
+		} as AgentMessage;
+	}
+
+	it("keeps a bash-edited tracked file in goal evidence even when edit touched another path", () => {
+		const dir = gitRepo();
+		writeFileSync(join(dir, "helper.ts"), "export function hasLeadingTilde() { return true; }\n");
+		writeFileSync(join(dir, "goal.ts"), "export const goal = 'BASH_TRACKED_MARKER';\n");
+		writeFileSync(join(dir, "unrelated.ts"), `${"x".repeat(500)}\n`);
+		const focus = collectTouchedPaths(
+			[
+				toolCall("edit", { path: "helper.ts" }),
+				toolCall("bash", { command: "sed -i '' \"s/old/BASH_TRACKED_MARKER/\" goal.ts" }),
+			],
+			dir,
+		);
+		expect(focus).toEqual(expect.arrayContaining(["helper.ts", "goal.ts"]));
+		const evidence = gatherDiffEvidence(dir, "final", { focusPaths: focus });
+		expect(evidence).toContain("BASH_TRACKED_MARKER");
+		expect(evidence).toContain("git diff HEAD (files this run edited)");
+		const otherBlock = evidence.split("git diff HEAD (other working-tree files):")[1] ?? "";
+		expect(otherBlock).not.toContain("BASH_TRACKED_MARKER");
+	});
+
+	it("does not treat a test-runner bash call as dirtying unrelated tracked files", () => {
+		const dir = gitRepo();
+		writeFileSync(join(dir, "helper.ts"), "export function hasLeadingTilde() { return true; }\n");
+		writeFileSync(join(dir, "unrelated.ts"), `${"x".repeat(500)}\n`);
+		const focus = collectTouchedPaths(
+			[toolCall("edit", { path: "helper.ts" }), toolCall("bash", { command: "npx vitest run paths.test.ts" })],
+			dir,
+		);
+		expect(focus).toEqual(["helper.ts"]);
+		const evidence = gatherDiffEvidence(dir, "final", { focusPaths: focus, maxChars: 800 });
+		expect(evidence).toContain("hasLeadingTilde");
+		expect(evidence).toContain(OTHER_DIFF_TRUNCATION_MARKER);
+		expect(evidence).not.toContain(GOAL_DIFF_TRUNCATION_MARKER);
 		expect(evidenceTruncationBlocksVerified(evidence)).toBe(false);
 	});
 });
